@@ -644,14 +644,45 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             # 以前把 cold_start 原样传给框架：框架先重启一遍，失败后这里再
             # 重启一遍，单个任务白耗 40 多秒。
             self._restart_client()
-            return super().recover(cold_start=False)
+            try:
+                return super().recover(cold_start=False)
+            except Exception as exc:
+                # 浮层挡住「赚更多」时框架会逐层 go_back 退到桌面再判失败；
+                # 此时页面可能已经稳定下来。最后再试一次：浮层常在这一轮自行
+                # 消退，重读屏往往已经在落地页或任务列表，能捞回就别提前收工。
+                return self._last_ditch_recover(exc)
         try:
             return super().recover(cold_start=False)
         except Exception as exc:
             if not self._restart_client():
                 raise
             logger.warning('导航未能恢复，已强制重启闲鱼后重试：%s', exc)
-            return super().recover(cold_start=False)
+            try:
+                return super().recover(cold_start=False)
+            except Exception as exc2:
+                return self._last_ditch_recover(exc2)
+
+    def _last_ditch_recover(self, exc):
+        """导航判失败后的最后兜底：读当前屏，能进面板就进，否则原样抛出。"""
+        package = self.origin or 'com.taobao.idlefish'
+        try:
+            screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
+        except Exception:
+            raise exc
+        if not (screen.package or '').startswith(package):
+            raise exc
+        try:
+            if self._accept_list(screen):
+                logger.info('导航虽判失败，但当前已在任务列表，继续执行')
+                return screen
+            if self.activity_landing(screen):
+                resumed = self.enter_task_panel(screen)
+                if resumed is not None and self._accept_list(resumed):
+                    logger.info('导航虽判失败，但已重新打开任务面板，继续执行')
+                    return resumed
+        except Exception as rescued:
+            logger.warning('最后兜底恢复出错：%s', rescued)
+        raise exc
 
     def _restart_client(self):
         """回桌面 → force-stop → 重新启动。每轮只做一次。"""

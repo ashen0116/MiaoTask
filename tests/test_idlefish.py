@@ -285,3 +285,47 @@ class ClaimReceiptTests(unittest.TestCase):
                    600, 1000, r.origin)
         tasks = r.parse_tasks(s.nodes, s.width, s.height)
         self.assertEqual([t.title for t in tasks], ['浏览好物'])
+
+    def test_overlay_without_close_does_not_go_back(self):
+        # 浮层关不掉时按返回键会把 H5 落地页整层退掉，框架随后逐层 go_back
+        # 退到桌面判失败。修复后应留在落地页等待，绝不调用系统返回键。
+        r = self.runner()
+        r.guard = Mock()
+        r.config['overlay_wait_seconds'] = 0
+        r._close_overlay = Mock(return_value=False)
+        r._reenter_landing = Mock(return_value=None)
+        landing = Screen([TextNode('再走4步完成1圈', (100, 800, 500, 840))],
+                         600, 1000, r.origin)
+        # 落地页上找不到可点入口：模拟「赚更多」点过一次、浮层挡住、
+        # 重算后仍找不到入口的场景。绝不能退而按系统返回键。
+        r.task_panel_visible = Mock(return_value=False)
+        r.panel_loading = Mock(return_value=False)
+        r.activity_landing = Mock(return_value=True)
+        r.task_panel_entry = Mock(return_value=None)
+        r._accept_list = Mock(return_value=False)
+        r.control.now.side_effect = [0, 0, 0, 0, 99999]
+        r.read.return_value = landing
+        r.enter_task_panel(landing)
+        r.device.go_back.assert_not_called()
+
+    def test_last_ditch_recover_opens_panel_from_landing(self):
+        r = self.runner()
+        landing = Screen([TextNode('再走4步完成1圈', (100, 800, 500, 840))],
+                         600, 1000, r.origin)
+        ready = self.panel()
+        r.read.return_value = landing
+        r.activity_landing = Mock(return_value=True)
+        r.enter_task_panel = Mock(return_value=ready)
+        # 第一次 _accept_list(落地页)=False 才会去 enter_task_panel；
+        # 第二次 _accept_list(面板)=True 才返回成功。
+        r._accept_list = Mock(side_effect=[False, True])
+        result = r._last_ditch_recover(RuntimeError('navigation failed'))
+        self.assertIs(result, ready)
+        r.enter_task_panel.assert_called_once()
+
+    def test_last_ditch_recover_reraises_when_off_app(self):
+        r = self.runner()
+        desktop = Screen([], 600, 1000, 'com.miui.home')
+        r.read.return_value = desktop
+        with self.assertRaises(RuntimeError):
+            r._last_ditch_recover(RuntimeError('navigation failed'))

@@ -269,6 +269,29 @@ class EntryPolicy:
                 return coin
         return None
 
+    def _reenter_landing(self, screen):
+        """浮层把页面带离落地页后，在闲鱼应用内自行重进落地页。
+
+        返回新的屏幕对象表示已重进；返回 None 表示这次没找到入口（交给调用方
+        继续等待）。只在应用内调用，绝不按系统返回键或退回桌面。
+        """
+        if self._accept_list(screen) or self.activity_landing(screen):
+            return screen
+        target = self.activity_entry(screen, homepage=self.homepage_visible(screen))
+        if target is None:
+            return None
+        logger.info('浮层后重新进入活动：%s | %s', target.text, target.bounds)
+        self.click(target)
+        self.control.wait(1.0)
+        for _ in range(6):
+            fresh = self.read(force_ocr=bool(self.config['ocr']))
+            if self._accept_list(fresh) or self.activity_landing(fresh):
+                return fresh
+            if not (fresh.package or '').startswith('com.taobao.idlefish'):
+                return None
+            self.control.wait(0.6)
+        return None
+
     # ---- 官方活动入口（闲鱼无独立官方卡片，返回 None） ----
     @staticmethod
     def official_activity_entry(screen):
@@ -361,14 +384,24 @@ class EntryPolicy:
                     retried = True
                     tapped_at = None
                     # 点了「赚更多」但面板没出现且仍在落地页：多半是弹窗挡了
-                    # 点击。先试「×」关闭；找不到关闭按钮就按返回键关浮层
-                    # （H5 弹窗响应返回键），关不掉退出落地页则由框架重进，
-                    # 重进后弹窗通常不再出现——避免在被挡入口上空点到超时。
+                    # 点击。先试「×」关闭；找不到关闭按钮时不要按系统返回键——
+                    # 落地页是 H5，返回键会直接把整个活动页退掉。一旦离开落地页，
+                    # 框架会走「逐层返回」一路 go_back 退到桌面，冷启动预算用完后
+                    # 直接判失败提前收工（实测「去头条玩一玩」后中招）。
+                    # 这里改成留在落地页内重试：等浮层自行消退并重算入口坐标。
                     if not self._close_overlay(screen):
-                        logger.info('弹窗无关闭按钮，按返回键尝试关闭浮层')
-                        self.device.go_back()
-                        self.control.wait(1.2)
+                        logger.info('弹窗无关闭按钮，留在落地页等待浮层消退，不按返回键')
+                        self.control.wait(float(self.config.get('overlay_wait_seconds', 2.0)))
                     screen = self.read(force_ocr=bool(self.config['ocr']))
+                    # 万一浮层/动画还是把页面带离了落地页，且我们仍在闲鱼应用内，
+                    # 就自己重新找「闲鱼币」入口回到落地页，而不是把脱离落地页的
+                    # 状态交给框架 step_back（那会一路退到桌面）。
+                    if (not self._accept_list(screen) and not self.activity_landing(screen)
+                            and (screen.package or '').startswith('com.taobao.idlefish')):
+                        restored = self._reenter_landing(screen)
+                        if restored is not None:
+                            logger.info('浮层退离落地页后已自行重进，继续打开任务面板')
+                            screen = restored
                     logger.info('关闭浮层后重算入口坐标，重试一次')
                     continue
                 logger.warning('点击「赚更多」后 %.0f 秒仍未出现任务列表，判定失败', panel_wait)

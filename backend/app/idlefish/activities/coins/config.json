@@ -12,6 +12,7 @@
   "return_settle_seconds": 1.5,
   "resume_settle_seconds": 1.5,
   "restart_settle_seconds": 5.0,
+  "overlay_wait_seconds": 2.0,
   "teardown_claim_rewards": false,
   "teardown_walk_steps": false,
   "exit_dialog_tries": 4,
