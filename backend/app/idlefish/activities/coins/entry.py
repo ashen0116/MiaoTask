@@ -136,7 +136,7 @@ class EntryPolicy:
         return TextNode('赚更多', (cx - half, cy - half, cx + half, cy + half), 'anchor')
 
     # ---- 几何锚点失效时的局部 OCR 兜底（只识别按钮带） ----
-    def _visual_entry(self, screen):
+    def _visual_entry(self, screen, force=False):
         if not self.config.get('ocr_fallback', True):
             return None
         # 只在闲鱼币大富翁落地页做 OCR 兜底；执行任务途中停留的其它页面
@@ -144,9 +144,10 @@ class EntryPolicy:
         # 在那里识别纯属空跑，还会刷「未识别到赚更多」日志。
         if not self.activity_landing(screen):
             return None
-        # 页面还没渲染完时 OCR 只会空跑，节流到每 2 秒最多一次
+        # 页面还没渲染完时 OCR 只会空跑，节流到每 2 秒最多一次；
+        # 浮层重试场景 force=True 跳过节流，确保真的重算一次入口。
         now = self.control.now()
-        if now - getattr(self, '_visual_entry_at', 0) < 2:
+        if not force and now - getattr(self, '_visual_entry_at', 0) < 2:
             return None
         self._visual_entry_at = now
         reader = getattr(self, 'reader', None)
@@ -269,29 +270,6 @@ class EntryPolicy:
                 return coin
         return None
 
-    def _reenter_landing(self, screen):
-        """浮层把页面带离落地页后，在闲鱼应用内自行重进落地页。
-
-        返回新的屏幕对象表示已重进；返回 None 表示这次没找到入口（交给调用方
-        继续等待）。只在应用内调用，绝不按系统返回键或退回桌面。
-        """
-        if self._accept_list(screen) or self.activity_landing(screen):
-            return screen
-        target = self.activity_entry(screen, homepage=self.homepage_visible(screen))
-        if target is None:
-            return None
-        logger.info('浮层后重新进入活动：%s | %s', target.text, target.bounds)
-        self.click(target)
-        self.control.wait(1.0)
-        for _ in range(6):
-            fresh = self.read(force_ocr=bool(self.config['ocr']))
-            if self._accept_list(fresh) or self.activity_landing(fresh):
-                return fresh
-            if not (fresh.package or '').startswith('com.taobao.idlefish'):
-                return None
-            self.control.wait(0.6)
-        return None
-
     # ---- 官方活动入口（闲鱼无独立官方卡片，返回 None） ----
     @staticmethod
     def official_activity_entry(screen):
@@ -382,27 +360,37 @@ class EntryPolicy:
                 if (not retried and not self.task_panel_visible(screen)
                         and self.activity_landing(screen)):
                     retried = True
-                    tapped_at = None
-                    # 点了「赚更多」但面板没出现且仍在落地页：多半是弹窗挡了
-                    # 点击。先试「×」关闭；找不到关闭按钮时不要按系统返回键——
-                    # 落地页是 H5，返回键会直接把整个活动页退掉。一旦离开落地页，
-                    # 框架会走「逐层返回」一路 go_back 退到桌面，冷启动预算用完后
-                    # 直接判失败提前收工（实测「去头条玩一玩」后中招）。
-                    # 这里改成留在落地页内重试：等浮层自行消退并重算入口坐标。
+                    # 点了「赚更多」但面板没出现且仍在落地页：多半是运营浮层挡了
+                    # 点击。绝不按系统返回键——落地页是 H5，返回键会把整个活动页
+                    # 退掉，框架随后「逐层返回」一路 go_back 到桌面，冷启动预算
+                    # 用完后直接判失败提前收工（实测「去头条玩一玩」后中招）。
+                    # 关不掉就留在落地页等浮层自行消退，然后在这里直接重算坐标
+                    # 并把「赚更多」再点一次——成功那轮正是靠这一次点进去的。
+                    # 绝不调用会点「我的」标签的重进逻辑（会让首页/我的来回跳）。
                     if not self._close_overlay(screen):
                         logger.info('弹窗无关闭按钮，留在落地页等待浮层消退，不按返回键')
                         self.control.wait(float(self.config.get('overlay_wait_seconds', 2.0)))
                     screen = self.read(force_ocr=bool(self.config['ocr']))
-                    # 万一浮层/动画还是把页面带离了落地页，且我们仍在闲鱼应用内，
-                    # 就自己重新找「闲鱼币」入口回到落地页，而不是把脱离落地页的
-                    # 状态交给框架 step_back（那会一路退到桌面）。
-                    if (not self._accept_list(screen) and not self.activity_landing(screen)
-                            and (screen.package or '').startswith('com.taobao.idlefish')):
-                        restored = self._reenter_landing(screen)
-                        if restored is not None:
-                            logger.info('浮层退离落地页后已自行重进，继续打开任务面板')
-                            screen = restored
                     logger.info('关闭浮层后重算入口坐标，重试一次')
+                    # 重算后当场再点一次入口，不把「等待」交回外层循环：
+                    # 外层在 expected_activity=False（冷启动恢复）时找不到入口会
+                    # 立刻 return 失败，触发框架 step_back 退到桌面。
+                    if not self._accept_list(screen) and self.activity_landing(screen):
+                        # 浮层会把「赚更多」的几何锚点顶歪，强制走 OCR 全屏兜底
+                        # （含固定比例坐标），比几何推算更能点到真入口。
+                        retry_entry = self._visual_entry(screen, force=True) or self.task_panel_entry(screen)
+                        if retry_entry is not None:
+                            logger.info('重试点击任务面板入口：%s | %s',
+                                        retry_entry.text, retry_entry.bounds)
+                            self.click(retry_entry)
+                            tapped_at = self.control.now()
+                            self.control.wait(0.4)
+                            screen = self.read(force_ocr=bool(self.config['ocr']))
+                            continue
+                    # 浮层还没退、这次没找到可靠入口：再给它一点时间并重读，
+                    # 保持在落地页内处理，绝不 return 失败给框架的逐层返回。
+                    self.control.wait(float(self.config.get('overlay_wait_seconds', 2.0)))
+                    screen = self.read(force_ocr=bool(self.config['ocr']))
                     continue
                 logger.warning('点击「赚更多」后 %.0f 秒仍未出现任务列表，判定失败', panel_wait)
                 return screen
