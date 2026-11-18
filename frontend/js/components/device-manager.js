@@ -4,22 +4,45 @@
   const labels={disconnected:'未连接',connecting:'连接中',ready:'已连接',running:'执行中',paused:'已暂停',scanning:'识别中',finished:'已结束',stopping:'停止中',stopped:'已停止',needs_attention:'待处理',error:'异常'};
   const busy=row=>Boolean(row?.busy||['running','connecting','scanning','paused','stopping'].includes(row?.status));
   let snapshot,checked=new Set(['default']),editorId=null,creating=false,preparing=false,wanted='',discovery=0,method='usb';
+  let restoreDone=false,restoring=false;
   const cards=new Map(),drafts=new Map(),seenConnected=new Set();
+  const storeKey='miaotask.devices.v1';
   MiaoDialogs.bind(dialog);
   const error=message=>window.dispatchEvent(new CustomEvent('miaotask:error',{detail:message}));
+  function readStore(){try{const value=JSON.parse(localStorage.getItem(storeKey)||'{}');return {labels:Array.isArray(value.labels)?value.labels.filter(item=>typeof item==='string'&&item.trim()):[],connections:value.connections&&typeof value.connections==='object'?value.connections:{}};}catch{return {labels:[],connections:{}};}}
+  function writeStore(store){try{localStorage.setItem(storeKey,JSON.stringify(store));}catch{}}
+  function syncLabels(){const rows=snapshot?.workspaces||[];if(!rows.length)return;const labels=rows.map(row=>row.label),store=readStore();if(JSON.stringify(labels)!==JSON.stringify(store.labels)){store.labels=labels;writeStore(store);}}
+  async function restore(){
+    if(restoreDone||restoring||!snapshot||dialog.open)return;
+    const store=readStore(),rows=snapshot.workspaces||[];
+    if(store.labels.length<=rows.length){restoreDone=true;return;}
+    restoring=true;restoreDone=true;
+    try{
+      for(let i=0;i<rows.length&&i<store.labels.length;i++)if(rows[i].label!==store.labels[i])await MiaoAPI.request('/api/workspaces/rename',{method:'POST',token:snapshot.token,payload:{id:rows[i].id,label:store.labels[i]}});
+      for(let i=rows.length;i<store.labels.length;i++)await MiaoAPI.request('/api/workspaces',{method:'POST',token:snapshot.token,payload:{label:store.labels[i]}});
+      window.dispatchEvent(new Event('miaotask:workspaces-changed'));
+    }catch{}finally{restoring=false;}
+  }
   function select(id){if(MiaoAPI.device===id)return;MiaoAPI.selectDevice(id);window.dispatchEvent(new CustomEvent('miaotask:device-selected',{detail:id}));}
   function connectionMode(value){
     method=value;$('wired-connection').hidden=value==='wifi';$('device-hint').hidden=value==='wifi';
     $('wifi-manager').hidden=value!=='wifi';$('wifi-manager').open=value==='wifi';
     for(const button of dialog.querySelectorAll('[data-connection-mode]'))button.setAttribute('aria-pressed',String(button.dataset.connectionMode===value));
   }
-  function saveDraft(){if(editorId)drafts.set(editorId,{serial:$('serial').value,type:$('device-type').value});}
+  function saveDraft(){
+    if(editorId){
+      const serial=$('serial').value,type=$('device-type').value;
+      drafts.set(editorId,{serial,type});
+      const row=snapshot?.workspaces?.find(item=>item.id===editorId);
+      if(row){const store=readStore();store.connections[row.label]={serial,type};writeStore(store);}
+    }
+  }
   function openEditor(id){
     editorId=id;creating=!id;wanted='';
-    const row=snapshot?.workspaces?.find(item=>item.id===id),draft=drafts.get(id);
+    const row=snapshot?.workspaces?.find(item=>item.id===id),draft=drafts.get(id),remembered=row?readStore().connections[row.label]:null;
     $('new-device-name').value=row?.label||'';
-    $('serial').value=creating?'':snapshot?.device?.serial||draft?.serial||'';
-    $('device-type').value=creating?'uiautomator2':snapshot?.device?.type||draft?.type||'uiautomator2';
+    $('serial').value=creating?'':snapshot?.device?.serial||draft?.serial||remembered?.serial||'';
+    $('device-type').value=creating?'uiautomator2':snapshot?.device?.type||draft?.type||remembered?.type||'uiautomator2';
     $('add-device-title').textContent=creating?'添加设备':'设备连接';
     $('confirm-add-device').textContent=creating?'仅创建设备':'保存名称';
     $('add-device-message').textContent='';
@@ -103,7 +126,7 @@
         if(editorId!==source)throw new Error('设备已切换，请重新打开连接设置');
         await MiaoAPI.request('/api/workspaces/rename',{method:'POST',token:snapshot.token,payload:{id:editorId,label}});
       }
-      window.dispatchEvent(new Event('miaotask:workspaces-changed'));return editorId;
+      syncLabels();window.dispatchEvent(new Event('miaotask:workspaces-changed'));return editorId;
     }finally{preparing=false;render();}
   }
   $('add-device').addEventListener('click',()=>openEditor(null));$('add-device-close').addEventListener('click',()=>dialog.close());
@@ -112,9 +135,9 @@
   $('new-device-address').addEventListener('change',()=>{const option=$('new-device-address').selectedOptions[0];if(!option?.value)return;$('serial').value=option.value;$('device-type').value=option.dataset.type||'uiautomator2';connectionMode('usb');});
   for(const button of dialog.querySelectorAll('[data-connection-mode]'))button.addEventListener('click',()=>connectionMode(button.dataset.connectionMode));
   $('confirm-add-device').addEventListener('click',async()=>{try{await prepare();dialog.close();}catch(cause){$('add-device-message').textContent=cause.message;}});
-  $('remove-device').addEventListener('click',async()=>{try{const id=editorId,result=await MiaoAPI.request('/api/workspaces/remove',{method:'POST',token:snapshot.token,payload:{id}});checked.delete(id);dialog.close();select(result.devices[0].id);}catch(cause){error(cause.message);}});
+  $('remove-device').addEventListener('click',async()=>{try{const id=editorId,result=await MiaoAPI.request('/api/workspaces/remove',{method:'POST',token:snapshot.token,payload:{id}});checked.delete(id);const store=readStore();store.labels=store.labels.filter(label=>label!==snapshot?.workspaces?.find(row=>row.id===id)?.label);delete store.connections[snapshot?.workspaces?.find(row=>row.id===id)?.label];writeStore(store);dialog.close();select(result.devices[0].id);}catch(cause){error(cause.message);}});
   for(const [id,action] of [['batch-run','run'],['batch-open-app','open_app'],['batch-stop','stop']])$(id).addEventListener('click',()=>window.dispatchEvent(new CustomEvent('miaotask:batch',{detail:{devices:[...checked],action}})));
   window.addEventListener('miaotask:device-selected',()=>{saveDraft();if(dialog.open&&editorId!==MiaoAPI.device)dialog.close();});
-  window.addEventListener('miaotask:state',event=>{snapshot=event.detail;const known=new Set((snapshot.workspaces||[]).map(row=>row.id));checked=new Set([...checked].filter(id=>known.has(id)));render();if(wanted===snapshot.workspace_id)openEditor(wanted);});
+  window.addEventListener('miaotask:state',event=>{snapshot=event.detail;const known=new Set((snapshot.workspaces||[]).map(row=>row.id));checked=new Set([...checked].filter(id=>known.has(id)));render();if(wanted===snapshot.workspace_id)openEditor(wanted);restore();});
   window.MiaoDevices=Object.freeze({prepare,refresh:render,get creating(){return creating&&dialog.open;},get preparing(){return preparing;}});
 })();

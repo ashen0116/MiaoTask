@@ -7,14 +7,29 @@
   $('activity-info-close').addEventListener('click',()=>infoDialog.close());
   const key=item=>item.app+'/'+item.activity;
   const error=message=>window.dispatchEvent(new CustomEvent('miaotask:error',{detail:message}));
-  function plan(){if(!snapshot||snapshot.workspace_id&&snapshot.workspace_id!==MiaoAPI.device)return [];return pending.get(MiaoAPI.device)?.activities || snapshot.activity_plan || (snapshot.app&&snapshot.activity?[{app:snapshot.app,activity:snapshot.activity}]:[]);}
+  const planKey='miaotask.activity-plan.v1';
+  function readSavedPlan(){
+    let value;
+    try{value=localStorage.getItem(planKey);}catch{return [];}
+    if(value===null)return [];
+    try{
+      const parsed=JSON.parse(value);
+      if(!Array.isArray(parsed))return [];
+      const available=new Set((snapshot?.catalog||[]).flatMap(app=>(app.activities||[]).map(activity=>app.id+'/'+activity.id)));
+      return parsed.filter(item=>item&&item.app&&item.activity&&(!available.size||available.has(item.app+'/'+item.activity))).map(item=>({app:item.app,activity:item.activity}));
+    }catch{return [];}
+  }
+  function writeSavedPlan(activities){
+    try{localStorage.setItem(planKey,JSON.stringify(activities.map(item=>({app:item.app,activity:item.activity}))));}catch{}
+  }
+  function plan(){if(!snapshot||snapshot.workspace_id&&snapshot.workspace_id!==MiaoAPI.device)return [];return pending.get(MiaoAPI.device)?.activities || readSavedPlan();}
   function busy(){return Boolean(snapshot?.busy||snapshot?.plugins_busy||pending.has(MiaoAPI.device)||['running','connecting','scanning','paused','stopping'].includes(snapshot?.status));}
   function label(item){return snapshot?.catalog?.find(app=>app.id===item.app)?.activities?.find(activity=>activity.id===item.activity)?.label||item.activity;}
   async function save(activities){
     if(!snapshot||busy())return;
     const device=MiaoAPI.device, token=snapshot.token;
     pending.set(device,{activities:activities.map(item=>({app:item.app,activity:item.activity})),since:Date.now()});signature='';render();
-    try{await MiaoAPI.request('/api/select_pipeline',{method:'POST',token,device,payload:{activities}});window.dispatchEvent(new Event('miaotask:plan-changed'));}
+    try{await MiaoAPI.request('/api/select_pipeline',{method:'POST',token,device,payload:{activities}});writeSavedPlan(activities);window.dispatchEvent(new Event('miaotask:plan-changed'));}
     catch(cause){pending.delete(device);signature='';render();error(cause.message);}
   }
   function update(item,enabled){const next=plan().filter(other=>key(other)!==key(item));if(enabled)next.push(item);if(next.length>16){error('每台设备最多选择16个活动');render();return;}save(next);}
