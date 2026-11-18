@@ -90,6 +90,43 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             return True
         return any(re.fullmatch(CUMULATIVE_RE, t) for t in texts)
 
+    # 任务标题里能确定的外部 App。只有确认设备没装时才在列表阶段跳过，
+    # 免得点进去、等二十多秒、再导航回来才知道没装。映射不确定时宁可不跳：
+    # 读不到已安装列表也一律不过滤，避免误杀本来能做的任务。
+    EXTERNAL_APP_MAP = {
+        '百亿补贴': ('com.taobao.taobao',),
+        '闪购': ('com.taobao.taobao',),
+        '淘宝': ('com.taobao.taobao',),
+        '天猫': ('com.tmall.wireless', 'com.taobao.taobao'),
+        '一淘': ('com.taobao.etao', 'com.taobao.taobao'),
+        '点淘': ('com.taobao.litetao', 'com.taobao.taobao'),
+        '支付宝': ('com.eg.android.AlipayGphone',),
+        '蚂蚁': ('com.eg.android.AlipayGphone',),
+        '芭芭农场': ('com.eg.android.AlipayGphone',),
+        '大众点评': ('com.dianping.v1',),
+        '百度地图': ('com.baidu.BaiduMap',),
+    }
+
+    def _target_app_missing(self, title):
+        packages = next((pkgs for word, pkgs in self.EXTERNAL_APP_MAP.items()
+                         if word in title), None)
+        if not packages:
+            return False
+        if not hasattr(self, '_idle_installed_packages'):
+            try:
+                found = self.device.installed_packages()
+                # 空列表是「一个 App 都没装」，不是读取失败；别用真假值判断
+                self._idle_installed_packages = (set(found)
+                                                 if isinstance(found, (set, list, tuple))
+                                                 else None)
+            except Exception as exc:
+                logger.debug('读取已安装应用列表失败，不提前过滤任务：%s', exc)
+                self._idle_installed_packages = None
+        installed = self._idle_installed_packages
+        if installed is None:
+            return False
+        return not any(p in installed for p in packages)
+
     # ------------------------------------------------------------------
     # 契约：解析任务（签到 / 领取奖励 / 去完成）
     # ------------------------------------------------------------------
@@ -104,12 +141,16 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                   and 0 < n.bounds[3] - n.bounds[1] < height * 0.05
                   and re.search(r'[\u4e00-\u9fff]', n.text)
                   and not re.fullmatch(ACTION_RE, normalize(n.text))
-                  and not re.fullmatch(CUMULATIVE_RE, normalize(n.text))]
+                  and not re.fullmatch(CUMULATIVE_RE, normalize(n.text))
+                  # 「收益+10%」这类红色奖励标签紧贴按钮，OCR 常把它读成一行
+                  # 乱码标题再跟按钮配对，生成根本不存在的任务
+                  and not re.search(r'收益|[+＋]\s*\d+\s*%|\d+%', normalize(n.text))]
         for btn in buttons:
             action = normalize(btn.text)
             # 标题与按钮同一行；「签到」是独立按钮，没有同行标题
             row = [n for n in titles
-                   if abs(n.center[1] - btn.center[1]) < height * 0.02]
+                   if abs(n.center[1] - btn.center[1]) < height * 0.02
+                   and btn.bounds[0] - n.bounds[2] > width * 0.06]
             if row:
                 title_node = min(row, key=lambda n: (n.bounds[0],
                                                     abs(n.center[1] - btn.center[1])))
@@ -122,12 +163,22 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                 continue
             if any(k in title for k in self.config['skip_titles']):
                 continue
+            if self._target_app_missing(title):
+                # 同一任务每扫一屏都会重新解析，日志去重，别刷屏
+                if title not in getattr(self, '_skip_logged', set()):
+                    logger.info('目标应用未安装，列表中直接跳过：%s', title)
+                    self._skip_logged = getattr(self, '_skip_logged', set()) | {title}
+                continue
             current, total = self._progress(nodes, btn, height)
             seconds = (self.config['browse']['video_seconds']
                        if self._is_video(title)
                        else self.config['browse']['regular_seconds'])
             # Stable identity: progress belongs to framework verification, not the key.
             key = hashlib.sha256(title.encode()).hexdigest()[:16]
+            # 刚点过「领取奖励」的同一档行先别再解析。页面刷新慢时框架下一轮
+            # 会再点一次同一个按钮，白花 5～8 秒；进度变了（新的一档）不受影响。
+            if (key, current, action) in getattr(self, '_claimed_rows', set()):
+                continue
             tasks.append(Task(key, title, title, action, btn.bounds,
                               current=current, total=total, seconds=seconds,
                               kind=self._classify(title, action)))
@@ -263,10 +314,24 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             return self._claim_ready(task, self._return_to_list(), explicit=explicit), explicit, False
         if task.kind == 'visit':
             # 跳转类：点「去完成」跳到其它 App，停留几秒后回闲鱼。
-            # 回到任务列表后确认该任务是否已变成「领取奖励」/进度+1：
-            # 未安装目标 App 时跳转无效，行仍是「去完成」，判为无法完成并跳过，
-            # 不再重试（raise TaskUnavailable 让框架标记该任务不可用）。
-            self.control.wait(float(self.config.get('visit_seconds', 5)))
+            # 未安装目标 App 时跳转根本不会发生，以前仍等满 visit_seconds 再走
+            # 整套返回导航，一个做不了的任务白耗 25～30 秒。这里先短等确认是否
+            # 真的离开了闲鱼：点了还停在任务列表，就直接判不可达跳过。
+            quick = max(0.5, float(self.config.get('visit_quick_check_seconds', 2.0)))
+            self.control.wait(quick)
+            screen = self.read()
+            self.guard(screen)
+            if self._still_on_list(screen):
+                # 再给一拍，排除服务端慢半拍才跳转的情况
+                self.control.wait(1)
+                screen = self.read()
+                self.guard(screen)
+                if self._still_on_list(screen):
+                    logger.info('点击后仍停留在任务列表，判定跳转未生效：%s', task.title)
+                    raise TaskUnavailable('跳转任务未完成（目标App可能未安装），跳过：%s' % task.title)
+            remain = float(self.config.get('visit_seconds', 5)) - quick
+            if remain > 0:
+                self.control.wait(remain)
             screen = self._return_to_list(cold_start=False)
             if not self._visit_done(task, screen):
                 raise TaskUnavailable('跳转任务未完成（目标App可能未安装），跳过：%s' % task.title)
@@ -300,6 +365,8 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                         if t.title == task.title), None)
             if row is not None and row.action in ('领取奖励', '立即领取'):
                 self._completed_evidence = getattr(self, '_completed_evidence', set()) | {task.key}
+                self._claimed_rows = getattr(self, '_claimed_rows', set()) | {
+                    (task.key, task.current, row.action)}
                 logger.info('任务已完成，领取奖励：%s', task.title)
                 self.click(TextNode(row.action, row.bounds))
                 self.control.wait(float(self.config.get('claim_settle_seconds', 0.6)))
@@ -324,7 +391,7 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
     # ------------------------------------------------------------------
     # 契约：核验
     # ------------------------------------------------------------------
-    def verify(self, task, before, after, explicit=False):
+    def _verify_impl(self, task, before, after, explicit=False):
         """Count only same-task progress, reward eligibility or explicit receipts."""
         if after.package != self.origin:
             return False
@@ -346,6 +413,29 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         # 任务行消失：领取类视为已领；浏览类要求页面给过完成提示
         return task.kind == 'claim'
 
+    def verify(self, task, before, after, explicit=False):
+        ok = self._verify_impl(task, before, after, explicit)
+        if ok and after is not None and getattr(after, 'nodes', None):
+            try:
+                if self.is_task_list(after.nodes):
+                    self._verified_list_screen = after
+            except Exception:
+                pass
+        return ok
+
+    def _refresh_after_success(self, task=None):
+        """成功后复用刚核验过的列表屏，省掉框架默认的一次截图+OCR。
+
+        活动执行末尾已经回到任务列表并读过屏；核验成功时那一屏就是最新列表，
+        再让框架读一遍纯属重复。缓存只留一拍，非列表屏仍走框架原有恢复逻辑。
+        """
+        cached = getattr(self, '_verified_list_screen', None)
+        self._verified_list_screen = None
+        if cached is not None and self.is_task_list(cached.nodes):
+            self.control.check()
+            return cached
+        return super()._refresh_after_success(task)
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -353,8 +443,15 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         # 导航（闲鱼 → 我的 → 闲鱼币 → 赚更多）完全交给框架 ensure_list，
         # 进入后不做任何地图滑动或掷骰子，避免误触。
         self._client_restarted = False
+        self._skip_logged = set()
+        self._claimed_rows = set()
 
     def teardown(self):
+        claim = bool(self.config.get('teardown_claim_rewards', True))
+        walk = bool(self.config.get('teardown_walk_steps', True))
+        if not claim and not walk:
+            logger.info('按配置关闭累计奖励与走步数，直接收工')
+            return
         # 只有确实没有待执行任务时才收尾；否则把累计奖励和走步数留到下一轮，
         # 避免「任务还没做完就先走步数」（例如达到 max-tasks 提前结束）。
         try:
@@ -366,15 +463,17 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         except Exception as exc:
             logger.info('收尾前检查未通过，停止收尾：%s', exc)
             return
-        try:
-            self._claim_top_rewards()
-        except Exception as exc:
-            logger.warning('领取累计任务奖励失败（已忽略）：%s', exc)
-        try:
-            self._back_to_coin_page()
-            self._walk_steps()
-        except Exception as exc:
-            logger.warning('走步数阶段异常（已忽略）：%s', exc)
+        if claim:
+            try:
+                self._claim_top_rewards()
+            except Exception as exc:
+                logger.warning('领取累计任务奖励失败（已忽略）：%s', exc)
+        if walk:
+            try:
+                self._back_to_coin_page()
+                self._walk_steps()
+            except Exception as exc:
+                logger.warning('走步数阶段异常（已忽略）：%s', exc)
 
     def _has_pending(self, screen):
         """任务列表里是否还有本活动要做的「去完成」任务。"""
@@ -491,8 +590,9 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
     def _dismiss_exit_dialogs(self, screen, tries=None):
         """广告/视频页的退出确认会连弹两次：一直点到不再出现为止。
 
-        「跳过」和「坚持退出/残忍离开/离开」合并成一组，不区分第几层弹窗；
-        每次点完等一秒再读屏，回到任务列表或找不到按钮就停。
+        OCR 常把「去体验5秒可立即领奖」和「跳过」读成一个节点，点它的中心
+        落在两个按钮中间，连点几次都没反应。同一文案连点两次还弹着就改按
+        返回键，让 H5 弹窗自己关掉，不再空耗剩余次数。
         """
         if tries is None:
             tries = int(self.config.get('exit_dialog_tries', 4))
@@ -501,15 +601,30 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         if not words:
             return screen
         pattern = '|'.join(re.escape(w) for w in words)
+        settle = float(self.config.get('exit_dialog_interval', 1.0))
+        last_text, same = None, 0
         for _ in range(max(1, tries)):
             if self._at_task_list(screen):
                 return screen
             node = self._find(screen, pattern)
             if node is None:
                 return screen
+            text = normalize(node.text)
+            if text == last_text:
+                same += 1
+                if same >= 2:
+                    logger.info('退出弹窗「%s」连点无效，改按返回键', text)
+                    self.device.go_back()
+                    self.control.wait(settle)
+                    screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
+                    last_text, same = None, 0
+                    continue
+            else:
+                same = 0
+            last_text = text
             logger.info('退出确认弹窗，点击「%s」', node.text)
             self.click(node)
-            self.control.wait(float(self.config.get('exit_dialog_interval', 1.0)))
+            self.control.wait(settle)
             screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
         return screen
 
@@ -524,8 +639,14 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         任务列表，导航把预算耗完就抛「未能自动恢复应用活动任务列表」。这里补一次
         真正的杀进程重开，把 H5 页面栈清干净再走一遍导航；还是不行才向上抛。
         """
+        if cold_start:
+            # 调用方明确要冷启动时，自己干净地重启一次，框架只负责导航。
+            # 以前把 cold_start 原样传给框架：框架先重启一遍，失败后这里再
+            # 重启一遍，单个任务白耗 40 多秒。
+            self._restart_client()
+            return super().recover(cold_start=False)
         try:
-            return super().recover(cold_start=cold_start)
+            return super().recover(cold_start=False)
         except Exception as exc:
             if not self._restart_client():
                 raise
@@ -565,14 +686,29 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             raise TaskUnavailable('读屏不可用，无法确认是否回到任务列表')
         # 跳转到其它 App 时（package 不是闲鱼），返回键只会退那个 App 直到桌面，
         # 回不到闲鱼；直接恢复（启动闲鱼 + 导航回任务列表），不傻按返回键。
-        if not (screen.package or '').startswith('com.taobao.idlefish'):
+        origin = self.origin or 'com.taobao.idlefish'
+        if not (screen.package or '').startswith(origin):
             if self._at_task_list(screen):
                 return screen
+            # 跨 App 任务结束时闲鱼通常还在后台，先直接把它切回前台即可。
+            # 以前这里一律 cold_start=True（杀进程重启），页面栈和 H5 状态全丢，
+            # 还要重新走一遍导航；只有真的切不回来才该走冷启动。
             try:
-                return self.recover(cold_start=True)
+                self.device.resume_app(origin)
+                self.control.wait(float(self.config.get('resume_settle_seconds', 1.5)))
+                resumed = self.read()
+                if resumed is not None and (resumed.package or '').startswith(origin):
+                    logger.info('已将闲鱼切回前台，继续返回任务列表')
+                    screen = resumed
+                else:
+                    raise TaskUnavailable('切回闲鱼后仍在其它应用')
             except Exception as exc:
-                logger.warning('跨 App 返回闲鱼失败：%s', exc)
-                return screen
+                logger.warning('直接切回闲鱼失败，改用冷启动：%s', exc)
+                try:
+                    return self.recover(cold_start=True)
+                except Exception as exc2:
+                    logger.warning('跨 App 返回闲鱼失败：%s', exc2)
+                    return screen
         # 视频/广告页：把连弹的退出确认一次点干净，再判断是否已经回到列表
         if self._is_ad_or_video_page(screen):
             screen = self._dismiss_exit_dialogs(screen)
@@ -611,6 +747,13 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             except Exception as exc:
                 logger.warning('返回任务列表失败：%s', exc)
         return screen
+
+    def _still_on_list(self, screen):
+        """点击「去完成」后是否仍停在闲鱼任务列表（说明跳转根本没生效）。"""
+        origin = self.origin or 'com.taobao.idlefish'
+        if not (screen.package or '').startswith(origin):
+            return False
+        return self.is_task_list(screen.nodes)
 
     def _visit_done(self, task, screen):
         """回到任务列表后，该跳转任务是否已完成（行变成「领取奖励」/进度+1）。

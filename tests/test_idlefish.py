@@ -199,3 +199,89 @@ class ClaimReceiptTests(unittest.TestCase):
         after, explicit, _ = r.execute(task, screen)
         self.assertFalse(explicit)
         self.assertFalse(r.verify(task, screen, after, explicit=explicit))
+
+    def test_visit_skips_fast_when_click_stays_on_list(self):
+        r = self.runner()
+        r.guard = Mock()
+        r._return_to_list = Mock()
+        screen = self.panel()
+        r.read.return_value = screen
+        task = Task(key='v1', title='浏览好物', detail='', action='去完成',
+                    bounds=(0, 0, 100, 20), kind='visit')
+        r._stable_target = Mock(return_value=(screen, task))
+        with self.assertRaises(TaskUnavailable):
+            r.execute(task, screen)
+        r._return_to_list.assert_not_called()
+
+    def test_refresh_reuses_verified_list_screen(self):
+        r = self.runner()
+        screen = self.panel()
+        r._verified_list_screen = screen
+        self.assertIs(r._refresh_after_success(), screen)
+
+    def test_teardown_can_disable_rewards_and_walk(self):
+        r = self.runner()
+        r.config['teardown_claim_rewards'] = False
+        r.config['teardown_walk_steps'] = False
+        r.read = Mock()
+        r._claim_top_rewards = Mock()
+        r._walk_steps = Mock()
+        r.teardown()
+        r._claim_top_rewards.assert_not_called()
+        r._walk_steps.assert_not_called()
+
+    def test_return_resumes_idle_fish_before_cold_start(self):
+        r = self.runner()
+        r.recover = Mock()
+        outside = Screen([], 600, 1000, 'com.taobao.taobao')
+        r.read.return_value = self.panel()
+        r._return_to_list(outside)
+        r.device.resume_app.assert_called_once_with(r.origin)
+        r.recover.assert_not_called()
+
+    def test_return_cold_starts_only_when_resume_fails(self):
+        r = self.runner()
+        r.recover = Mock(return_value=self.panel())
+        outside = Screen([], 600, 1000, 'com.taobao.taobao')
+        r.device.resume_app.side_effect = RuntimeError('synthetic resume failure')
+        r._return_to_list(outside)
+        r.recover.assert_called_once_with(cold_start=True)
+
+    def test_close_overlay_closes_all_matches_in_one_screen(self):
+        r = self.runner()
+        s = Screen([TextNode('×', (100, 100, 120, 120)),
+                    TextNode('×', (200, 100, 220, 120)),
+                    TextNode('前进获得闲鱼币', (100, 150, 700, 200)),
+                    TextNode('前进获得闲鱼币', (100, 300, 700, 350))],
+                   600, 1000, r.origin)
+        self.assertTrue(r._close_overlay(s))
+        self.assertEqual(r.click.call_count, 4)
+
+    def test_exit_dialog_falls_back_to_back_key_after_two_noops(self):
+        r = self.runner()
+        r.setup()
+        dialog = Screen([TextNode('去体验5秒可立即领奖|跳过', (100, 300, 500, 340))],
+                        600, 1000, r.origin)
+        r.read.return_value = dialog
+        r._at_task_list = Mock(return_value=False)
+        r._dismiss_exit_dialogs(dialog)
+        self.assertGreaterEqual(r.device.go_back.call_count, 1)
+
+    def test_claimed_row_not_parsed_again(self):
+        r = self.runner()
+        r.setup()
+        screen = self.panel(action='领取奖励')
+        task = r.parse_tasks(screen.nodes, screen.width, screen.height)[0]
+        r._claimed_rows = {(task.key, task.current, '领取奖励')}
+        self.assertEqual(r.parse_tasks(screen.nodes, screen.width, screen.height), [])
+
+    def test_parse_tasks_skips_uninstalled_external_app(self):
+        r = self.runner()
+        r.device.installed_packages = Mock(return_value=[])
+        s = Screen([TextNode('去百亿补贴领红包', (100, 190, 400, 210)),
+                    TextNode('去完成', (450, 190, 550, 210)),
+                    TextNode('浏览好物', (100, 290, 400, 310)),
+                    TextNode('去完成', (450, 290, 550, 310))],
+                   600, 1000, r.origin)
+        tasks = r.parse_tasks(s.nodes, s.width, s.height)
+        self.assertEqual([t.title for t in tasks], ['浏览好物'])

@@ -299,28 +299,38 @@ class EntryPolicy:
     _OVERLAY_CLOSE_RE = r'^(×|✕|x|X|关闭|跳过|以后再说|残忍拒绝)$'
 
     def _close_overlay(self, screen):
-        """在当前屏幕上找弹窗的「×」类关闭按钮，找到就点掉。返回是否点到。"""
+        """关掉当前屏幕上所有能识别到的浮层，返回是否点到。
+
+        同屏常叠着运营弹窗和步数引导卡，原来一次只关一个、调用方再读一遍屏
+        重新找，往往连读三四次。这里在一屏上把能点的一次点完，只等一次。
+        """
+        closed = False
         for n in screen.nodes:
             t = normalize(n.text)
             if t and re.fullmatch(self._OVERLAY_CLOSE_RE, t):
                 logger.info('检测到活动弹窗浮层，点击「%s」关闭', t)
                 self.click(n)
-                self.control.wait(1.0)
-                return True
+                closed = True
         # 「前进获得闲鱼币」引导浮层是画布绘制的卡片，关闭键既不在控件树里，
-        # OCR 也常把它漏成空节点，于是只剩「按返回键」这一条路——而返回键会
-        # 把落地页整层退掉，还得从头导航。这里按标题定位，点标题同一行的最右侧
-        # （关闭键固定贴在卡片右上角），当作「×」的兜底。
+        # OCR 也常把它漏成空节点。按标题定位，点标题同一行最右侧（关闭键固定
+        # 贴在卡片右上角），当作「×」的兜底；同屏多个卡片一次点完。
         guide = str(self.config.get('guide_title_regex') or '')
-        title = self._find(screen, guide) if guide else None
-        if title is not None:
-            x = int(screen.width * float(self.config.get('guide_close_x', 0.88)))
-            y = title.center[1]
-            logger.info('检测到步数引导浮层，按标题位置点击关闭 (%d,%d)', x, y)
-            self.click(TextNode('关闭浮层', (x - 24, y - 16, x + 24, y + 16)))
+        if guide:
+            pattern = re.compile(guide)
+            for title in (n for n in screen.nodes if pattern.search(normalize(n.text))):
+                y = title.center[1]
+                if y > screen.height * 0.5:
+                    # 引导卡片固定在屏幕上半部；标题跑到下半屏多半是 OCR 把
+                    # 任务行读错了，照着点会误触「去完成」按钮
+                    logger.debug('引导浮层标题位置异常（y=%d），忽略本次点击', y)
+                    continue
+                x = int(screen.width * float(self.config.get('guide_close_x', 0.88)))
+                logger.info('检测到步数引导浮层，按标题位置点击关闭 (%d,%d)', x, y)
+                self.click(TextNode('关闭浮层', (x - 24, y - 16, x + 24, y + 16)))
+                closed = True
+        if closed:
             self.control.wait(1.0)
-            return True
-        return False
+        return closed
 
     def enter_task_panel(self, screen, expected_activity=False):
         panel_wait = self.config.get('panel_open_timeout', 10)
