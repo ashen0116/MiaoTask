@@ -336,3 +336,29 @@ class ClaimReceiptTests(unittest.TestCase):
         r.read.return_value = desktop
         with self.assertRaises(RuntimeError):
             r._last_ditch_recover(RuntimeError('navigation failed'))
+
+    def test_guard_ignores_single_black_video_frame(self):
+        # 视频黑场单帧被核心判成 obscured，重读后恢复就应放行，不整轮停。
+        from backend.core.errors import NeedsAttention
+        r = self.runner()
+        r.assert_instance = Mock()
+        r.config['obscured_confirm_frames'] = 3
+        r.config['obscured_confirm_interval'] = 0
+        black = Screen([], 600, 1000, r.origin, obscured=True)
+        normal = self.panel()
+        r.read.return_value = normal  # 重读第一帧就恢复
+        r.guard(black)  # 不应抛异常
+        r.read.assert_called()
+
+    def test_guard_stops_on_persistent_black_screen(self):
+        # 连续多帧都黑才是真的受保护页面，照常抛 NeedsAttention。
+        from backend.core.errors import NeedsAttention
+        r = self.runner()
+        r.assert_instance = Mock()
+        r.report_failure = Mock(return_value=None)
+        r.config['obscured_confirm_frames'] = 3
+        r.config['obscured_confirm_interval'] = 0
+        black = Screen([], 600, 1000, r.origin, obscured=True)
+        r.read.return_value = black
+        with self.assertRaises(NeedsAttention):
+            r.guard(black)

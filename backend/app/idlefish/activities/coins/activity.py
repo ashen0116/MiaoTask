@@ -48,6 +48,37 @@ BROWSE_SECONDS_RE = r'浏览\s*(\d+)\s*[秒sS]'
 class IdleFishCoinsActivity(EntryPolicy, Activity):
     application = PROFILE
 
+    def guard(self, screen):
+        """视频页黑场会被核心 guard 误判成「受保护页面」而整轮停掉。
+
+        核心 screen 判定是「单帧最亮像素 < 8 就是 obscured」，视频播放/转场的
+        一帧全黑就中招（新设备上更常见），随后 check_attention 直接 NeedsAttention
+        收工。这里在闲鱼活动内做二次确认：闲鱼前台的单帧黑屏先重读几帧，只要
+        有一帧恢复就放行；连续多帧都黑才认定为真的受保护页面，交回核心处理。
+        验证码/登录/支付等其它拦截一律照常走核心判定，不放宽。
+        """
+        self.assert_instance(screen)
+        from backend.core.execution.guard import check_attention, attention_reason, OBSCURED_REASON
+        if (getattr(screen, 'obscured', False)
+                and (screen.package or '').startswith('com.taobao.idlefish')):
+            found = attention_reason(self, screen)
+            # 只有当拦截原因「就是黑屏」时才二次确认；验证码/登录等其它证据
+            # 在 attention_reason 里排在黑屏之前，found[0] 不是黑屏文案就照常拦。
+            if found is not None and found[0] == OBSCURED_REASON:
+                tries = int(self.config.get('obscured_confirm_frames', 3))
+                for _ in range(max(1, tries)):
+                    self.control.wait(float(self.config.get('obscured_confirm_interval', 1.0)))
+                    try:
+                        fresh = self.read(force_ocr=bool(self.config.get('ocr', False)))
+                    except Exception:
+                        continue
+                    self.assert_instance(fresh)
+                    if not getattr(fresh, 'obscured', False) and attention_reason(self, fresh) is None:
+                        logger.info('黑屏为视频转场帧，已确认恢复，继续执行')
+                        return
+                logger.warning('连续多帧画面不可读取，按受保护页面处理')
+        check_attention(self, screen)
+
     def read(self, **kwargs):
         screen = super().read(**kwargs)
         self.guard(screen)
