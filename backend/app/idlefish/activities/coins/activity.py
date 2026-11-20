@@ -619,44 +619,33 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         return self._find(screen, self._AD_VIDEO_RE) is not None
 
     def _dismiss_exit_dialogs(self, screen, tries=None):
-        """广告/视频页的退出确认会连弹两次：一直点到不再出现为止。
+        """广告/视频页的退出确认，只点一次，点不就走就让外层重启重进。
 
-        OCR 常把「去体验5秒可立即领奖」和「跳过」读成一个节点，点它的中心
-        落在两个按钮中间，连点几次都没反应。同一文案连点两次还弹着就改按
-        返回键，让 H5 弹窗自己关掉，不再空耗剩余次数。
+        实测「去体验15秒可立即领奖|跳过」这类弹窗点了根本不回列表（OCR 把
+        两个按钮读成一个节点，点中心落在中间没反应），后面还会再弹一个；
+        旧实现连点 4 次、两次改按返回键，空耗十几秒，最后仍是靠杀 APP 重启
+        才回到任务列表。既然终点都是重启，这里点一次无效就立刻停手，把屏
+        交回外层走恢复，省掉无效连点。真能一次关掉的弹窗仍然受用，不亏。
         """
-        if tries is None:
-            tries = int(self.config.get('exit_dialog_tries', 4))
         words = [str(w) for w in (list(self.config.get('video_skip_words') or [])
                                   + list(self.config.get('video_exit_words') or [])) if w]
         if not words:
             return screen
+        if self._at_task_list(screen):
+            return screen
         pattern = '|'.join(re.escape(w) for w in words)
         settle = float(self.config.get('exit_dialog_interval', 1.0))
-        last_text, same = None, 0
-        for _ in range(max(1, tries)):
-            if self._at_task_list(screen):
-                return screen
-            node = self._find(screen, pattern)
-            if node is None:
-                return screen
-            text = normalize(node.text)
-            if text == last_text:
-                same += 1
-                if same >= 2:
-                    logger.info('退出弹窗「%s」连点无效，改按返回键', text)
-                    self.device.go_back()
-                    self.control.wait(settle)
-                    screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
-                    last_text, same = None, 0
-                    continue
-            else:
-                same = 0
-            last_text = text
-            logger.info('退出确认弹窗，点击「%s」', node.text)
-            self.click(node)
-            self.control.wait(settle)
-            screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
+        node = self._find(screen, pattern)
+        if node is None:
+            return screen
+        logger.info('退出确认弹窗，点击「%s」', node.text)
+        self.click(node)
+        self.control.wait(settle)
+        screen = self.read(force_ocr=bool(self.config.get('ocr', False)))
+        if self._at_task_list(screen):
+            return screen
+        # 弹窗还在（或点了没反应）：不再连点、不再按返回键，交回外层重启重进。
+        logger.info('退出弹窗点击后未回到列表，交给恢复流程重进活动')
         return screen
 
     # ------------------------------------------------------------------
@@ -785,10 +774,8 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                 self._exit_game()
                 screen = self.read()
                 continue
-            if self._is_ad_or_video_page(screen):
-                screen = self._dismiss_exit_dialogs(screen)
-                if self._at_task_list(screen):
-                    return screen
+            # 退出弹窗前面已点过一次；这里不再重复点，避免空耗（点不中就
+            # 直接按返回/走恢复重进，终点都是重启）。
             # 已退到金币落地页（不在任务面板）：再退就越退越远，直接重开面板
             if self.activity_landing(screen):
                 break

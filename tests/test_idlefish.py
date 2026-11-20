@@ -166,14 +166,15 @@ class IdlefishContracts(unittest.TestCase):
         self.assertNotIn(task.key, getattr(r, '_completed_evidence', set()))
         r.read.assert_not_called()
 
-    def test_exit_dialog_second_confirmation_is_clicked(self):
+    def test_exit_dialog_clicks_only_once(self):
+        # 只点一次退出弹窗；即使后面还弹第二个也不再连点，交回外层重启。
         r = self.runner()
         first = Screen([TextNode('跳过', (100, 190, 250, 210))], 600, 1000, r.origin)
         second = Screen([TextNode('坚持退出', (100, 190, 250, 210))], 600, 1000, r.origin)
-        done = Screen([TextNode('去完成', (450, 190, 550, 210))], 600, 1000, r.origin)
-        r.read.side_effect = [second, done]
+        r.read.side_effect = [second]
         r._dismiss_exit_dialogs(first)
-        self.assertEqual(r.click.call_count, 2)
+        self.assertEqual(r.click.call_count, 1)
+        r.device.go_back.assert_not_called()
 
     def test_return_to_list_uses_page_back_button_once(self):
         r = self.runner()
@@ -257,7 +258,8 @@ class ClaimReceiptTests(unittest.TestCase):
         self.assertTrue(r._close_overlay(s))
         self.assertEqual(r.click.call_count, 4)
 
-    def test_exit_dialog_falls_back_to_back_key_after_two_noops(self):
+    def test_exit_dialog_no_back_key_on_noop(self):
+        # 弹窗点一次无效后不再按返回键、不再连点，避免空耗（交给外层重启）。
         r = self.runner()
         r.setup()
         dialog = Screen([TextNode('去体验5秒可立即领奖|跳过', (100, 300, 500, 340))],
@@ -265,7 +267,8 @@ class ClaimReceiptTests(unittest.TestCase):
         r.read.return_value = dialog
         r._at_task_list = Mock(return_value=False)
         r._dismiss_exit_dialogs(dialog)
-        self.assertGreaterEqual(r.device.go_back.call_count, 1)
+        self.assertEqual(r.click.call_count, 1)
+        r.device.go_back.assert_not_called()
 
     def test_claimed_row_not_parsed_again(self):
         r = self.runner()
