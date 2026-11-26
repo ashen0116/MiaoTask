@@ -86,9 +86,13 @@ class IdlefishContracts(unittest.TestCase):
         r.config['browse_extra_seconds']=1
         panel=self.panel()
         video=Screen([TextNode('广告',(100,300,200,320))],600,1000,r.origin)
-        # 第一屏仍是任务列表（H5 还没跳转），第二屏才是视频页
+        # 第一屏仍是任务列表（H5 还没跳转），之后始终是视频页
         r.control.now.side_effect=[0,0,5]
-        r.read.side_effect=[panel,video]
+        reads={'n':0}
+        def read_once(*a,**k):
+            reads['n']+=1
+            return panel if reads['n']==1 else video
+        r.read.side_effect=read_once
         screen,explicit=r._video_browse(1)
         self.assertIs(screen,video); self.assertFalse(explicit)
 
@@ -167,13 +171,13 @@ class IdlefishContracts(unittest.TestCase):
         r.read.assert_not_called()
 
     def test_exit_dialog_clicks_only_once(self):
-        # 只点一次退出弹窗；即使后面还弹第二个也不再连点，交回外层重启。
+        # 同一个弹窗连点两次没变化就停手，不再空耗，也不按返回键。
         r = self.runner()
         first = Screen([TextNode('跳过', (100, 190, 250, 210))], 600, 1000, r.origin)
-        second = Screen([TextNode('坚持退出', (100, 190, 250, 210))], 600, 1000, r.origin)
-        r.read.side_effect = [second]
+        r.read.return_value = first  # 点了没变化
+        r._at_task_list = Mock(return_value=False)
         r._dismiss_exit_dialogs(first)
-        self.assertEqual(r.click.call_count, 1)
+        self.assertEqual(r.click.call_count, 1)  # 点一次无效即止
         r.device.go_back.assert_not_called()
 
     def test_return_to_list_uses_page_back_button_once(self):
