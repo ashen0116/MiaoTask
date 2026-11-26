@@ -45,8 +45,12 @@ COUNTDOWN_RE = r'(?:还需|剩余|再逛|再看|浏览还差)[^\d]{0,3}(\d{1,2})
 BROWSE_SECONDS_RE = r'浏览\s*(\d+)\s*[秒sS]'
 # 视频页自带的倒计时（「奖励将于14秒后发放」），按它等而不必死等配置秒数
 VIDEO_REWARD_COUNTDOWN_RE = r'奖励将于\s*(\d+)\s*秒后发放'
-# 二级确认弹窗（「观看满30秒即可获得奖励 确认要离开吗？」）
-VIDEO_LEAVE_DIALOG_RE = r'确认要离开吗|放弃奖励离开'
+# 二级确认弹窗标题；各种写法都要认：确认要离开吗 / 坚持退出 / 退出 /
+# 残忍离开 / 放弃奖励离开… 只认前两种会让「坚持退出」「退出」这类弹窗漏掉，
+# 脚本找不到弹窗就去按返回键，退不出去最后只能杀 APP 重启，白耗二十多秒。
+VIDEO_LEAVE_DIALOG_RE = (r'确认要离开吗|放弃奖励离开|坚持退出|残忍离开|'
+                         r'确认退出|确定退出|狠心退出|坚持离开|确认离开|'
+                         r'^退出$|退出任务|离开任务')
 
 
 class IdleFishCoinsActivity(EntryPolicy, Activity):
@@ -653,37 +657,55 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         return screen
 
     def _video_leave_button(self, screen):
-        """二级弹窗里的「放弃奖励离开」按钮；绝不返回「抓住奖励机会」。
+        """二级弹窗里真正「退出/离开」的按钮；绝不点「抓住奖励机会」。
 
-        弹窗标题「观看满30秒即可获得奖励 确认要离开吗？」里也带「离开」，
-        直接 find('离开') 会先命中标题文字，必须排除问句和挽留按钮。
+        弹窗标题（「观看满30秒即可获得奖励 确认要离开吗？」）里也带「离开」，
+        直接 find('离开') 会先命中标题文字，所以要排除问句和挽留按钮。
+        按钮写法很多：放弃奖励离开 / 坚持退出 / 残忍离开 / 退出 / 离开 /
+        确认退出…，都按配置里的词表来认，别只认前几种。
         """
         if screen is None:
             return None
         stay = [str(w) for w in (self.config.get('video_stay_words') or []) if w]
+        words = [str(w) for w in (self.config.get('video_leave_words') or [])
+                 if w and not any(s in w for s in stay)]
+        pattern = '|'.join(re.escape(w) for w in words) if words else ''
         for n in screen.nodes:
             text = normalize(n.text)
             if not text or any(w in text for w in stay):
                 continue
             if '?' in text or '？' in text or '吗' in text:
                 continue
-            if re.search(r'放弃奖励离开|残忍离开|坚持退出|离开任务|^离开$', text):
+            if pattern and re.search(pattern, text):
                 return n
         return None
 
     def _video_handle_leave_dialog(self, screen):
-        """二级确认弹窗出现就点「离开」；看满时长后离开照样算完成。"""
+        """视频退出确认弹窗：逐级点掉「退出/离开」，直到回列表或没有弹窗。
+
+        有的广告点一次 X 后连弹两级（「坚持退出」→「确认要离开吗」），只处理
+        一级就撒手，后面那级没人点，脚本只能按返回键、退不掉就杀 APP 重启。
+        这里连点几级，每点一次都读屏确认；一旦回到列表立即停手，不误伤。
+        """
         if screen is None:
             return False
-        if self._find(screen, VIDEO_LEAVE_DIALOG_RE) is None:
-            return False
-        button = self._video_leave_button(screen)
-        if button is None:
-            return False
-        logger.info('视频退出确认弹窗，点「%s」', button.text)
-        self.click(button)
-        self.control.wait(float(self.config.get('exit_dialog_interval', 1.0)))
-        return True
+        tries = max(1, int(self.config.get('video_exit_dialog_tries', 3)))
+        settle = float(self.config.get('exit_dialog_interval', 1.0))
+        clicked = False
+        for _ in range(tries):
+            if self._at_task_list(screen):
+                break
+            if self._find(screen, VIDEO_LEAVE_DIALOG_RE) is None:
+                break
+            button = self._video_leave_button(screen)
+            if button is None:
+                break
+            logger.info('视频退出确认弹窗，点「%s」', button.text)
+            self.click(button)
+            clicked = True
+            self.control.wait(settle)
+            screen = self._safe_read(screen)
+        return clicked
 
     def _video_tap_close(self, screen):
         """点视频页的关闭入口（跳过 / 关闭广告 / 右上角几何 X）。返回是否点过。"""

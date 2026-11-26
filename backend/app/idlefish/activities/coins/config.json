@@ -20,6 +20,7 @@
   "teardown_walk_steps": false,
   "exit_dialog_tries": 4,
   "exit_dialog_interval": 1.0,
+  "video_exit_dialog_tries": 3,
   "entry_ocr_label": "赚更多",
   "entry_ocr_band": [0.45, 0.75],
   "entry_ocr_fullscreen": true,
@@ -81,7 +82,7 @@
   "video_close_x_ratio": 0.91,
   "video_close_y_ratio": 0.08,
   "video_close_words": ["跳过", "跳过广告", "关闭广告", "关闭"],
-  "video_leave_words": ["放弃奖励离开", "坚持退出", "残忍离开", "离开"],
+  "video_leave_words": ["放弃奖励离开", "坚持退出", "残忍离开", "确认退出", "确定退出", "退出任务", "离开任务", "退出", "离开"],
   "video_stay_words": ["抓住奖励机会", "继续观看", "继续"],
 
   "browse_reward_prompt": "浏览(\\d+)秒获得",

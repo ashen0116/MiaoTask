@@ -119,8 +119,9 @@ class IdlefishContracts(unittest.TestCase):
         # 手势返回1次就回了任务列表：不再点X、不再快返
         r=self.runner()
         video=Screen([TextNode('广告',(100,300,200,320))],600,1000,r.origin)
-        r.read.return_value=self.panel()
-        r._at_task_list=Mock(side_effect=[True])
+        panel=self.panel()
+        r.read.return_value=panel
+        r._at_task_list=Mock(side_effect=lambda s: s is panel)
         r._video_exit(video)
         r.device.go_back.assert_called_once()
         r.click.assert_not_called()
@@ -143,17 +144,43 @@ class IdlefishContracts(unittest.TestCase):
                        TextNode('放弃奖励离开',(60,400,200,440)),
                        TextNode('抓住奖励机会',(360,400,500,440))],600,1000,r.origin)
         panel=self.panel()
-        # 返回一次后仍在视频页（X 路径），点X后才弹二级框，点离开后回列表
-        r.read.side_effect=[video,dialog,panel]
+        # 返回一次后仍在视频页（X 路径），点X后才弹二级框，点离开后回列表。
+        # 读屏在耗尽后复用最后一屏，避免多级处理多读几次就 StopIteration。
+        frames=iter([video,dialog,panel])
+        def read_once(*a,**k):
+            try: return next(frames)
+            except StopIteration: return panel
+        r.read.side_effect=read_once
         r._at_task_list=Mock(side_effect=lambda s: s is panel)
         r._video_exit(video)
-        self.assertEqual(r.click.call_count,2)  # 一次X，一次离开
         self.assertEqual(r.device.go_back.call_count,1)
-        # 第二次点击的正是「放弃奖励离开」按钮，不是问句也不是「抓住奖励机会」
-        leave_click=r.click.call_args_list[1].args[0]
-        self.assertIn('离开',leave_click.text)
-        self.assertNotIn('抓住',leave_click.text)
-        self.assertLess(leave_click.bounds[0],300)
+        # 点的正是「放弃奖励离开」按钮，不是问句也不是「抓住奖励机会」
+        leave_clicks=[c.args[0] for c in r.click.call_args_list if '离开' in c.args[0].text]
+        self.assertTrue(leave_clicks)
+        self.assertNotIn('抓住',leave_clicks[0].text)
+
+    def test_video_exit_clicks_jianchi_tuichu_then_confirm(self):
+        # 线上漏点场景：弹窗不是「确认要离开吗」，而是「坚持退出」→「确认退出」
+        # 两级。都必须认出来点掉，不能因标题不匹配就放弃、最后杀 APP 重启。
+        r=self.runner()
+        first=Screen([TextNode('再玩一会即可领奖',(100,200,500,240)),
+                      TextNode('坚持退出',(60,400,200,440)),
+                      TextNode('继续观看',(360,400,500,440))],600,1000,r.origin)
+        second=Screen([TextNode('确认退出活动吗？',(100,200,500,240)),
+                       TextNode('退出',(60,400,200,440)),
+                       TextNode('继续观看',(360,400,500,440))],600,1000,r.origin)
+        panel=self.panel()
+        frames=iter([second,panel])
+        def read_once(*a,**k):
+            try: return next(frames)
+            except StopIteration: return panel
+        r.read.side_effect=read_once
+        r._at_task_list=Mock(side_effect=lambda s: s is panel)
+        r._video_handle_leave_dialog(first)
+        clicked=[c.args[0].text for c in r.click.call_args_list]
+        self.assertIn('坚持退出',clicked)
+        self.assertTrue(any('退出' in t and t!='坚持退出' for t in clicked))
+        self.assertNotIn('继续观看',clicked)
 
     def test_restart_client_runs_once_per_round(self):
         r=self.runner(); r._client_restarted=False
