@@ -38,6 +38,16 @@ class IdlefishContracts(unittest.TestCase):
         self.assertFalse(r.verify(x,a,a))
         self.assertFalse(r.verify(x,a,Screen([],600,1000,r.origin)))
 
+    def test_external_app_gourmand_task_is_visit_not_browse(self):
+        # 「逛逛淘宝闪购天天免单」是跳到淘宝闪购的跳转任务，点进去即算完成，
+        # 不能因带「逛逛」就判成浏览白滑 22 秒还核验失败。
+        r = self.runner()
+        self.assertEqual(r._classify('逛逛淘宝闪购天天免单', '去完成'), 'visit')
+        self.assertEqual(r._classify('去淘宝签到领红包', '去完成'), 'visit')
+        self.assertEqual(r._classify('去百亿补贴领福利', '去完成'), 'visit')
+        # 站内无外部词才仍是浏览
+        self.assertEqual(r._classify('逛逛商城领超值优惠券', '去完成'), 'browse')
+
     def test_no_navigation_for_trade_task(self):
         r=self.runner(); task=Task('t','购买商品','','去完成',(0,0,1,1),kind='trade')
         with self.assertRaises(TaskUnavailable):r.execute(task,self.panel())

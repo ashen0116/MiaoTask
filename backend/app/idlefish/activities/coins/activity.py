@@ -141,10 +141,37 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         '点淘': ('com.taobao.litetao', 'com.taobao.taobao'),
         '支付宝': ('com.eg.android.AlipayGphone',),
         '蚂蚁': ('com.eg.android.AlipayGphone',),
+        '蚂蚁森林': ('com.eg.android.AlipayGphone',),
         '芭芭农场': ('com.eg.android.AlipayGphone',),
+        '口碑': ('com.eg.android.AlipayGphone',),
+        '闪购': ('com.taobao.taobao',),
+        '一淘': ('com.taobao.etao', 'com.taobao.taobao'),
+        '天猫': ('com.tmall.wireless', 'com.taobao.taobao'),
+        '聚划算': ('com.taobao.taobao',),
+        '淘金币': ('com.taobao.taobao',),
+        '点淘': ('com.taobao.litetao', 'com.taobao.taobao'),
         '大众点评': ('com.dianping.v1',),
-        '百度地图': ('com.baidu.BaiduMap',),
+        '点评': ('com.dianping.v1',),
+        '美团': ('com.sankuai.meituan',),
+        '外卖': ('com.sankuai.meituan',),
+        '百度地图': ('com.baidu.BaiduMap', 'com.baidu.map'),
+        '高德': ('com.autonavi.minimap',),
+        '京东': ('com.jingdong.app.mall',),
+        '抖音': ('com.ss.android.ugc.aweme',),
+        '快手': ('com.kuaishou.nebula', 'com.ghb.constants'),
+        '饿了么': ('com.eg.android.AlipayGphone', 'me.ele'),
+        '淘票票': ('com.taobao.taobao',),
+        '飞猪': ('com.taobao.taobao', 'com.trip.taobao'),
     }
+
+    @classmethod
+    def _has_external_app_word(cls, title):
+        """标题里是否带明确的外部 App 词（淘宝/闪购/支付宝…）。
+
+        用来区分站内浏览任务和跳到外部 App 的访问任务：带这些词的「逛逛」
+        是跳转，点进去即算完成，不能当浏览白滑。
+        """
+        return any(word in title for word in cls.EXTERNAL_APP_MAP)
 
     def _target_app_missing(self, title):
         packages = next((pkgs for word, pkgs in self.EXTERNAL_APP_MAP.items()
@@ -264,9 +291,12 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             return 'search'
         # 「看视频 / 浏览xx」都是闲鱼内的浏览任务（已实机验证：「去浏览福利好物」
         # 进入 CsjMall 页并提示「浏览15秒获得80闲鱼币」）。
-        # 站内「逛逛」类（逛逛商城等）才滑动浏览；「去逛一逛芭芭农场」这类是
-        # 跳转到外部小程序/活动的访问任务，跳过去后直接返回，不能在这里滑动
-        if self._is_video(title) or '浏览' in title or '逛逛' in title:
+        # 关键：标题里带明确外部 App 词（淘宝/闪购/芭芭农场/支付宝…）的是跳转
+        # 任务，即使写着「逛逛」也不能滑动——「逛逛淘宝闪购天天免单」跳到淘宝
+        # 闪购，点进去即算完成，以前按「逛逛」判浏览白滑 22 秒还核验失败。
+        # 只有站内「逛逛商城」这类（无外部 App 词）才滑动浏览。
+        if not self._has_external_app_word(title) and (
+                self._is_video(title) or '浏览' in title or '逛逛' in title):
             return 'browse'
         # 「点击指定频道好物」类任务已停用（用户要求不做）：归入 trade（跳过），
         # 由 enabled_task_kinds 过滤，框架直接不执行，也不会再点商品卡片。
