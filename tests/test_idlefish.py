@@ -38,6 +38,23 @@ class IdlefishContracts(unittest.TestCase):
         self.assertFalse(r.verify(x,a,a))
         self.assertFalse(r.verify(x,a,Screen([],600,1000,r.origin)))
 
+    def test_external_app_gourmand_task_is_visit_not_browse(self):
+        # 「逛逛淘宝闪购天天免单」带外部App词(淘宝/闪购)，是跳转任务，
+        # 不能按「逛逛」判成浏览白滑 22 秒。
+        r = self.runner()
+        self.assertEqual(r._classify('逛逛淘宝闪购天天免单', '去完成'), 'visit')
+        self.assertEqual(r._classify('去淘宝签到领红包', '去完成'), 'visit')
+        # 站内无外部词才仍是浏览
+        self.assertEqual(r._classify('逛逛商城领超值优惠券', '去完成'), 'browse')
+
+    def test_view_signature_tolerates_offset_title(self):
+        # 标题 x 位置偏移（新设备/OCR 差异）时也要算「有内容」，
+        # 否则签名变 None 会被框架误判无新行、提前收工漏掉下方任务。
+        r = self.runner()
+        s = Screen([TextNode('去蚂蚁森林逛一逛', (700, 200, 900, 230))],
+                   1000, 2000, r.origin)
+        self.assertIsNotNone(r.view_signature(s))
+
     def test_no_navigation_for_trade_task(self):
         r=self.runner(); task=Task('t','购买商品','','去完成',(0,0,1,1),kind='trade')
         with self.assertRaises(TaskUnavailable):r.execute(task,self.panel())

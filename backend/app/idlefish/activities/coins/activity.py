@@ -182,13 +182,17 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             # 与 parse_tasks 的任务标题识别条件保持一致，取行标题而非按钮
             # 文案：按钮只有「去完成/领取奖励」几种，滑动前后几乎不变，拿它
             # 当签名会让框架误判"没有新行"而提前收工。
+            # 签名只用来判断「这屏有没有新内容」，放宽到整屏的中文任务文案：
+            # 原来只认 x 在 12%~35% 窄列、高度 <5% 屏高的标题，新设备/OCR 位置
+            # 稍偏就全被滤掉、签名变 None，框架误判「没有新行」提前收工，列表
+            # 下方的任务整段漏做。放宽不会误执行任务（执行仍由 parse_tasks 严格
+            # 判定），只是让滚动更保守、把下面的任务都翻到。
             titles = [normalize(n.text) for n in nodes
-                      if width * 0.12 <= n.bounds[0] <= width * 0.35
-                      and n.bounds[2] <= width * 0.75
-                      and 0 < n.bounds[3] - n.bounds[1] < height * 0.05
+                      if 0 < n.bounds[3] - n.bounds[1] < height * 0.08
                       and re.search(r'[\u4e00-\u9fff]', n.text)
                       and not re.fullmatch(ACTION_RE, normalize(n.text))
-                      and not re.fullmatch(CUMULATIVE_RE, normalize(n.text))]
+                      and not re.fullmatch(CUMULATIVE_RE, normalize(n.text))
+                      and not re.search(r'收益|[+＋]\s*\d+\s*%|\d+%', normalize(n.text))]
             if not titles:
                 return None
             return tuple(sorted(titles))
@@ -248,6 +252,15 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         '淘票票': ('com.taobao.taobao',),
         '飞猪': ('com.taobao.taobao', 'com.trip.taobao'),
     }
+
+    @classmethod
+    def _has_external_app_word(cls, title):
+        """标题是否带明确的外部 App 词（淘宝/闪购/支付宝…）。
+
+        用于区分「站内浏览任务」和「跳到外部 App 的访问任务」，避免把
+        「逛逛淘宝闪购天天免单」当成站内浏览白滑 22 秒。
+        """
+        return any(word in title for word in cls.EXTERNAL_APP_MAP)
 
     def _target_app_missing(self, title):
         packages = next((pkgs for word, pkgs in self.EXTERNAL_APP_MAP.items()
@@ -367,9 +380,12 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             return 'search'
         # 「看视频 / 浏览xx」都是闲鱼内的浏览任务（已实机验证：「去浏览福利好物」
         # 进入 CsjMall 页并提示「浏览15秒获得80闲鱼币」）。
-        # 站内「逛逛」类（逛逛商城等）才滑动浏览；「去逛一逛芭芭农场」这类是
-        # 跳转到外部小程序/活动的访问任务，跳过去后直接返回，不能在这里滑动
-        if self._is_video(title) or '浏览' in title or '逛逛' in title:
+        # 关键：标题里带明确外部 App 词的（淘宝/闪购/芭芭农场/支付宝…）是跳转
+        # 任务，即使写着「逛逛」也不能滑动——「逛逛淘宝闪购天天免单」跳到淘宝
+        # 闪购，进来即算完成，以前按「逛逛」判成浏览，白滑 22 秒还核验失败。
+        # 只有站内「逛逛商城」这类（无外部 App 词）才滑动浏览。
+        if not self._has_external_app_word(title) and (
+                self._is_video(title) or '浏览' in title or '逛逛' in title):
             return 'browse'
         # 「点击指定频道好物」类任务已停用（用户要求不做）：归入 trade（跳过），
         # 由 enabled_task_kinds 过滤，框架直接不执行，也不会再点商品卡片。
