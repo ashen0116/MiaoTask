@@ -55,6 +55,18 @@ class IdlefishContracts(unittest.TestCase):
                    1000, 2000, r.origin)
         self.assertIsNotNone(r.view_signature(s))
 
+    def test_parse_tasks_tolerates_offset_title(self):
+        # 光放宽 view_signature 不够：parse_tasks 原来只认 x 在 12%~35% 窄列，
+        # 偏移的标题虽被当成「新行」，却解析不出任务，滑动后下方任务照样漏做。
+        r = self.runner()
+        s = Screen([TextNode('搜一搜推荐好物', (500, 300, 700, 330)),
+                    TextNode('去完成', (800, 300, 880, 330))],
+                   1000, 2000, r.origin)
+        tasks = r.parse_tasks(s.nodes, s.width, s.height)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].title, '搜一搜推荐好物')
+        self.assertEqual(tasks[0].kind, 'search')
+
     def test_no_navigation_for_trade_task(self):
         r=self.runner(); task=Task('t','购买商品','','去完成',(0,0,1,1),kind='trade')
         with self.assertRaises(TaskUnavailable):r.execute(task,self.panel())
@@ -70,8 +82,23 @@ class IdlefishContracts(unittest.TestCase):
         r._swipe_once.assert_called_once()
 
     def test_search_without_submission_does_not_swipe(self):
+        # 找不到入口时不再把任务直接判死（TaskUnavailable 会禁掉整天），
+        # 而是交回下一轮重试，所以返回 (screen, False)，且绝不在没搜索的页空滑。
         r=self.runner(); s=Screen([],600,1000,r.origin);r.read.return_value=s
-        with self.assertRaises(TaskUnavailable):r._search_task(s)
+        result=r._search_task(s)
+        self.assertIs(result[0],s); self.assertFalse(result[1])
+        r._swipe_once.assert_not_called()
+
+    def test_search_refocuses_input_after_failure(self):
+        # 复现线上日志：点入口后输入框没聚焦，input_text 第一次失败；
+        # 主动点一次搜索框拿到焦点后第二次输入成功，任务不该被跳过。
+        r=self.runner(); r.config['search_browse_swipes']=0
+        s=Screen([TextNode('搜索闲置好物',(100,50,500,100))],600,1000,r.origin)
+        r.read.return_value=s
+        r.device.input_text.side_effect=[TimeoutError('synthetic ime failure'), None]
+        result=r._search_task(s)
+        self.assertEqual(r.device.input_text.call_count,2)
+        self.assertTrue(result[1] is False or result[1] is True)
         r._swipe_once.assert_not_called()
 
     def test_search_inputs_keyword_before_swiping(self):

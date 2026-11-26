@@ -290,10 +290,14 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         buttons = [n for n in nodes
                    if re.fullmatch(ACTION_RE, normalize(n.text))
                    and n.center[0] > width * 0.55]
+        # 标题必须在按钮左边、同一行；放宽 x 范围（原来只认 12%~35% 窄列），
+        # 新设备/OCR 位置稍偏就整行漏掉，滑动后明明有任务却一个都识别不到，
+        # 框架还以为没新行提前收工——和 view_signature 保持一致，行配对仍由
+        # 下面的「同一行 + 在按钮左边」严格约束。
         titles = [n for n in nodes
-                  if width * 0.12 <= n.bounds[0] <= width * 0.35
-                  and n.bounds[2] <= width * 0.75
-                  and 0 < n.bounds[3] - n.bounds[1] < height * 0.05
+                  if n.bounds[2] <= width * 0.80
+                  and 0 < n.bounds[3] - n.bounds[1] < height * 0.08
+                  and height * 0.05 < n.center[1] < height * 0.92
                   and re.search(r'[\u4e00-\u9fff]', n.text)
                   and not re.fullmatch(ACTION_RE, normalize(n.text))
                   and not re.fullmatch(CUMULATIVE_RE, normalize(n.text))
@@ -1326,23 +1330,38 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         """搜索类任务（如「搜一搜推荐商品」）。
 
         点「去完成」进入搜索页后，光点推荐词是过不去的：闲鱼按「真的搜了商品
-        并浏览」计数，实测连续点「淘宝精选」十几次，进度始终 0/1。这里改成和
-        人工一致的做法：点开搜索框 → 输入关键词 → 提交搜索 → 滑动浏览结果。
+        并浏览」计数，实测连续点「淘宝精选」十几次，进度始终 0/1。这里和人工
+        一致：点搜索框 → 输入关键词 → 提交搜索 → 滑动浏览结果。
 
-        关键词取活动配置 task_search_keyword，留空时从公共词表
-        task_search_keywords 随机抽一个。输入不可用时退回点推荐词，
-        两者都确认不了就跳过，不在未搜索的页面上滑动。
+        日志里出现过「输入关键词失败（找不到聚焦的 EditText），改用推荐词」，
+        紧接着又因没看到「搜索发现」词云直接判任务退出。根因是点入口后输入框
+        没有拿到焦点、input_text 依赖聚焦的 Editable 才成功；而搜索页词云标题
+        未必是那几个固定文案。这里改成：先主动把搜索框点一下再输入，失败就
+        再来一轮；推荐词兜底也放宽。两轮都做不了就交回下一轮重试，不再直接
+        跳过把任务判死，也不在没有搜索的页面上空滑。
         """
-        s = self.read()
+        s = self._safe_read(screen)
         submitted = False
-        box = self._find(s, r'搜索|搜一搜|找闲置|搜你想不到')
+        box = self._find(s, r'搜索|搜一搜|找闲置|搜你想不到') or self._search_input_box(s)
         if box is not None:
             self.click(box)
             self.control.wait(0.8)
-            s = self.read()
+            s = self._safe_read(s)
+            # 点入口后输入框常常没聚焦，主动点一次真正的搜索框
+            input_box = self._search_input_box(s)
+            if input_box is not None:
+                self.click(input_box)
+                self.control.wait(0.5)
+                s = self._safe_read(s)
             submitted = self._input_search(s) or self._tap_suggestion(s)
+            if not submitted:
+                # 再给一轮：先点框拿焦点，再输入 / 点推荐词
+                self._focus_search_box(s)
+                s = self._safe_read(s)
+                submitted = self._input_search(s) or self._tap_suggestion(s)
         if not submitted:
-            raise TaskUnavailable('未确认搜索入口，跳过当前搜索任务')
+            logger.warning('搜索任务：两轮都没能提交搜索，交回下一轮重试')
+            return s, False
         # 浏览搜索结果：连续滑动若干次
         swipes = int(self.config.get('search_browse_swipes', 6))
         for _ in range(swipes):
@@ -1350,6 +1369,32 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             self.control.wait(0.4)
             s = self._safe_read(s)
         return s, bool(s.find(DONE_PROMPT_RE))
+
+    def _search_input_box(self, screen):
+        """找搜索页顶部的输入框：宽、靠上、带搜索字样。找不到返回 None。"""
+        if screen is None:
+            return None
+        candidates = []
+        for n in screen.nodes:
+            text = normalize(n.text)
+            width = n.bounds[2] - n.bounds[0]
+            height = n.bounds[3] - n.bounds[1]
+            if (re.search(r'搜索|搜一搜|找闲置|搜你想不到|请输入|输入要搜', text)
+                    and width > screen.width * 0.28
+                    and n.center[1] < screen.height * 0.32
+                    and 0 < height < screen.height * 0.15):
+                candidates.append(n)
+        return max(candidates, key=lambda n: n.bounds[2] - n.bounds[0]) if candidates else None
+
+    def _focus_search_box(self, screen):
+        """主动点一次搜索框，让 Editable 拿到焦点（input_text 依赖它）。"""
+        box = self._search_input_box(screen) or self._find(
+            screen, r'搜索|搜一搜|找闲置|搜你想不到')
+        if box is None:
+            return False
+        self.click(box)
+        self.control.wait(0.5)
+        return True
 
     def _search_keyword(self):
         """搜索任务用的关键词：活动配置优先，其次公共词表随机抽取。"""
@@ -1388,15 +1433,26 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         return True
 
     def _tap_suggestion(self, screen):
-        """输入不可用时，点搜索发现词云里的第一个推荐词。"""
-        if not self._find(screen, r'搜索发现|热门搜索|猜你想搜|历史搜索'):
+        """输入不可用时，点搜索发现词云里的第一个推荐词。
+
+        原来只认「搜索发现/热门搜索/猜你想搜/历史搜索」这几种标题，搜索页换成
+        「大家都在搜」等文案就返回 False，直接把任务判退出。这里放宽标题词表；
+        只要还在搜索页（顶部有输入框），即便词云标题没认出来，中间那段短中文
+        也当推荐词试一下，别轻易放弃。
+        """
+        if screen is None:
             return False
-        # 排除词云标题本身（搜索发现 / 猜你想搜 / 历史搜索）和按钮文本。
+        header = self._find(screen, r'搜索发现|热门搜索|猜你想搜|历史搜索|大家都在搜|今日热搜|热搜|搜索历史')
+        if header is None and self._search_input_box(screen) is None:
+            return False
+        # 排除词云标题本身和按钮文本，只取中间的短中文词。
         recs = [n for n in screen.nodes
                 if 2 <= len(normalize(n.text)) <= 10
                 and normalize(n.text) not in ('搜索发现', '热门搜索', '猜你想搜',
-                                              '历史搜索', '清空')
+                                              '历史搜索', '清空', '大家都在搜',
+                                              '今日热搜', '搜索历史')
                 and screen.height * 0.25 < n.center[1] < screen.height * 0.72
+                and re.search(r'[\u4e00-\u9fff]', n.text)
                 and not re.fullmatch(ACTION_RE, normalize(n.text))]
         if not recs:
             return False
