@@ -329,6 +329,20 @@ class EntryPolicy:
                 logger.info('检测到步数引导浮层，按标题位置点击关闭 (%d,%d)', x, y)
                 self.click(TextNode('关闭浮层', (x - 24, y - 16, x + 24, y + 16)))
                 closed = True
+        # 每日首次进大富翁会连弹几个运营弹窗，关闭键常是画布绘制的 X 图标，
+        # 既无文字也不在控件树里。对上半屏出现的可点击节点，按几何位置点它
+        # 右上角（浮层 X 的固定位置）关掉，避免干等浮层自己消退。
+        if not closed:
+            cx = int(screen.width * float(self.config.get('guide_close_x', 0.88)))
+            upper = [n for n in screen.nodes
+                     if 0.12 * screen.height < n.center[1] < 0.55 * screen.height
+                     and not normalize(n.text)]
+            if upper:
+                top_node = min(upper, key=lambda n: n.bounds[1])
+                cy = int(top_node.bounds[1]) + 24
+                logger.info('检测到无文字运营弹窗，按右上角几何位置点击 X (%d,%d)', cx, cy)
+                self.click(TextNode('关闭浮层', (cx - 24, cy - 16, cx + 24, cy + 16)))
+                closed = True
         if closed:
             self.control.wait(1.0)
         return closed
@@ -369,7 +383,7 @@ class EntryPolicy:
                     # 绝不调用会点「我的」标签的重进逻辑（会让首页/我的来回跳）。
                     if not self._close_overlay(screen):
                         logger.info('弹窗无关闭按钮，留在落地页等待浮层消退，不按返回键')
-                        self.control.wait(float(self.config.get('overlay_wait_seconds', 2.0)))
+                        self.control.wait(float(self.config.get('overlay_wait_seconds', 0.8)))
                     screen = self.read(force_ocr=bool(self.config['ocr']))
                     logger.info('关闭浮层后重算入口坐标，重试一次')
                     # 重算后当场再点一次入口，不把「等待」交回外层循环：
