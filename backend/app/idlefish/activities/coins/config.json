@@ -11,14 +11,8 @@
   "return_back_tries": 1,
   "return_settle_seconds": 1.5,
   "resume_settle_seconds": 1.5,
-  "video_back_settle": 1.0,
-  "video_fast_back_gap": 0.3,
-  "video_close_x_ratio": 0.912,
-  "video_close_x_left_ratio": 0.079,
-  "video_close_y_ratio": 0.085,
-  "cross_app_resume_tries": 3,
   "restart_settle_seconds": 5.0,
-  "overlay_wait_seconds": 0.8,
+  "overlay_wait_seconds": 2.0,
   "obscured_confirm_frames": 3,
   "obscured_confirm_interval": 1.0,
   "teardown_claim_rewards": false,
@@ -40,9 +34,6 @@
   "browse_read_interval": 3,
   "search_keyword": "",
   "task_search_keyword": "手机壳",
-
-  "max_scroll_pages": 20,
-  "empty_batch_stop": 2,
 
   "browse": {
     "regular_seconds": 20,

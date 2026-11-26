@@ -38,49 +38,6 @@ class IdlefishContracts(unittest.TestCase):
         self.assertFalse(r.verify(x,a,a))
         self.assertFalse(r.verify(x,a,Screen([],600,1000,r.origin)))
 
-    def test_external_app_gourmand_task_is_visit_not_browse(self):
-        # 「逛逛淘宝闪购天天免单」带外部App词(淘宝/闪购)，是跳转任务，
-        # 不能按「逛逛」判成浏览白滑 22 秒。
-        r = self.runner()
-        self.assertEqual(r._classify('逛逛淘宝闪购天天免单', '去完成'), 'visit')
-        self.assertEqual(r._classify('去淘宝签到领红包', '去完成'), 'visit')
-        # 站内无外部词才仍是浏览
-        self.assertEqual(r._classify('逛逛商城领超值优惠券', '去完成'), 'browse')
-
-    def test_view_signature_tolerates_offset_title(self):
-        # 标题 x 位置偏移（新设备/OCR 差异）时也要算「有内容」，
-        # 否则签名变 None 会被框架误判无新行、提前收工漏掉下方任务。
-        r = self.runner()
-        s = Screen([TextNode('去蚂蚁森林逛一逛', (700, 200, 900, 230))],
-                   1000, 2000, r.origin)
-        self.assertIsNotNone(r.view_signature(s))
-
-    def test_parse_tasks_tolerates_offset_title(self):
-        # 光放宽 view_signature 不够：parse_tasks 原来只认 x 在 12%~35% 窄列，
-        # 偏移的标题虽被当成「新行」，却解析不出任务，滑动后下方任务照样漏做。
-        r = self.runner()
-        s = Screen([TextNode('搜一搜推荐好物', (500, 300, 700, 330)),
-                    TextNode('去完成', (800, 300, 880, 330))],
-                   1000, 2000, r.origin)
-        tasks = r.parse_tasks(s.nodes, s.width, s.height)
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0].title, '搜一搜推荐好物')
-        self.assertEqual(tasks[0].kind, 'search')
-
-    def test_parse_tasks_picks_full_title_not_icon_label(self):
-        # 复现线上截图：任务行最左侧图标框写着「免单」「淘宝闪购」「补」这类
-        # 1~4 字短标签，真正的标题（10 字）在它右边。必须在同一行多个候选里
-        # 选中完整标题，否则生成残片任务，一失败就被锁成「今日失败已达上限」。
-        r = self.runner()
-        s = Screen([TextNode('免单', (60, 700, 150, 740)),
-                    TextNode('逛逛淘宝闪购天天免单', (180, 700, 620, 740)),
-                    TextNode('去完成', (800, 700, 950, 740))],
-                   1000, 2000, r.origin)
-        tasks = r.parse_tasks(s.nodes, s.width, s.height)
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0].title, '逛逛淘宝闪购天天免单')
-        self.assertEqual(tasks[0].kind, 'visit')
-
     def test_no_navigation_for_trade_task(self):
         r=self.runner(); task=Task('t','购买商品','','去完成',(0,0,1,1),kind='trade')
         with self.assertRaises(TaskUnavailable):r.execute(task,self.panel())
@@ -96,23 +53,8 @@ class IdlefishContracts(unittest.TestCase):
         r._swipe_once.assert_called_once()
 
     def test_search_without_submission_does_not_swipe(self):
-        # 找不到入口时不再把任务直接判死（TaskUnavailable 会禁掉整天），
-        # 而是交回下一轮重试，所以返回 (screen, False)，且绝不在没搜索的页空滑。
         r=self.runner(); s=Screen([],600,1000,r.origin);r.read.return_value=s
-        result=r._search_task(s)
-        self.assertIs(result[0],s); self.assertFalse(result[1])
-        r._swipe_once.assert_not_called()
-
-    def test_search_refocuses_input_after_failure(self):
-        # 复现线上日志：点入口后输入框没聚焦，input_text 第一次失败；
-        # 主动点一次搜索框拿到焦点后第二次输入成功，任务不该被跳过。
-        r=self.runner(); r.config['search_browse_swipes']=0
-        s=Screen([TextNode('搜索闲置好物',(100,50,500,100))],600,1000,r.origin)
-        r.read.return_value=s
-        r.device.input_text.side_effect=[TimeoutError('synthetic ime failure'), None]
-        result=r._search_task(s)
-        self.assertEqual(r.device.input_text.call_count,2)
-        self.assertTrue(result[1] is False or result[1] is True)
+        with self.assertRaises(TaskUnavailable):r._search_task(s)
         r._swipe_once.assert_not_called()
 
     def test_search_inputs_keyword_before_swiping(self):
@@ -144,13 +86,9 @@ class IdlefishContracts(unittest.TestCase):
         r.config['browse_extra_seconds']=1
         panel=self.panel()
         video=Screen([TextNode('广告',(100,300,200,320))],600,1000,r.origin)
-        # 第一屏仍是任务列表（H5 还没跳转），之后始终是视频页
+        # 第一屏仍是任务列表（H5 还没跳转），第二屏才是视频页
         r.control.now.side_effect=[0,0,5]
-        reads={'n':0}
-        def read_once(*a,**k):
-            reads['n']+=1
-            return panel if reads['n']==1 else video
-        r.read.side_effect=read_once
+        r.read.side_effect=[panel,video]
         screen,explicit=r._video_browse(1)
         self.assertIs(screen,video); self.assertFalse(explicit)
 
@@ -229,13 +167,13 @@ class IdlefishContracts(unittest.TestCase):
         r.read.assert_not_called()
 
     def test_exit_dialog_clicks_only_once(self):
-        # 同一个弹窗连点两次没变化就停手，不再空耗，也不按返回键。
+        # 只点一次退出弹窗；即使后面还弹第二个也不再连点，交回外层重启。
         r = self.runner()
         first = Screen([TextNode('跳过', (100, 190, 250, 210))], 600, 1000, r.origin)
-        r.read.return_value = first  # 点了没变化
-        r._at_task_list = Mock(return_value=False)
+        second = Screen([TextNode('坚持退出', (100, 190, 250, 210))], 600, 1000, r.origin)
+        r.read.side_effect = [second]
         r._dismiss_exit_dialogs(first)
-        self.assertEqual(r.click.call_count, 1)  # 点一次无效即止
+        self.assertEqual(r.click.call_count, 1)
         r.device.go_back.assert_not_called()
 
     def test_return_to_list_uses_page_back_button_once(self):
