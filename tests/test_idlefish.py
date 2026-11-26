@@ -92,6 +92,58 @@ class IdlefishContracts(unittest.TestCase):
         screen,explicit=r._video_browse(1)
         self.assertIs(screen,video); self.assertFalse(explicit)
 
+    def test_video_waits_by_page_countdown(self):
+        # 页面写「奖励将于14秒后发放」就按14秒等，不再死等配置里的18秒
+        r=self.runner(); r.config['browse']['video_seconds']=18
+        r.config['browse_extra_seconds']=1
+        video=Screen([TextNode('奖励将于14秒后发放',(100,80,400,110)),
+                      TextNode('广告',(100,300,200,320))],600,1000,r.origin)
+        r.control.now.side_effect=[0,0,20]
+        r.read.side_effect=[video,video]
+        r._video_exit=Mock(side_effect=lambda s:(s,False))
+        r._video_browse(18)
+        r.update.assert_any_call(message='浏览视频 15 秒')
+
+    def test_video_exit_back_once_returns_to_list(self):
+        # 手势返回1次就回了任务列表：不再点X、不再快返
+        r=self.runner()
+        video=Screen([TextNode('广告',(100,300,200,320))],600,1000,r.origin)
+        r.read.return_value=self.panel()
+        r._at_task_list=Mock(side_effect=[True])
+        r._video_exit(video)
+        r.device.go_back.assert_called_once()
+        r.click.assert_not_called()
+
+    def test_video_exit_quick_back_twice_when_stuck(self):
+        # 返回1次没回列表、又没有关闭入口：快速再返回2次
+        r=self.runner()
+        video=Screen([TextNode('广告',(100,300,200,320))],600,1000,r.origin)
+        r.read.return_value=video
+        r._at_task_list=Mock(return_value=False)
+        r._video_exit(video)
+        self.assertEqual(r.device.go_back.call_count,3)
+
+    def test_video_exit_x_then_leave_secondary_dialog(self):
+        # 退不掉的那种：点右上角X → 二级弹窗点「放弃奖励离开」，
+        # 绝不点「抓住奖励机会」，也不会把问句「确认要离开吗」当成按钮
+        r=self.runner()
+        video=Screen([TextNode('奖励将于14秒后发放',(100,80,400,110))],600,1000,r.origin)
+        dialog=Screen([TextNode('观看满30秒即可获得奖励 确认要离开吗？',(100,200,500,240)),
+                       TextNode('放弃奖励离开',(60,400,200,440)),
+                       TextNode('抓住奖励机会',(360,400,500,440))],600,1000,r.origin)
+        panel=self.panel()
+        # 返回一次后仍在视频页（X 路径），点X后才弹二级框，点离开后回列表
+        r.read.side_effect=[video,dialog,panel]
+        r._at_task_list=Mock(side_effect=lambda s: s is panel)
+        r._video_exit(video)
+        self.assertEqual(r.click.call_count,2)  # 一次X，一次离开
+        self.assertEqual(r.device.go_back.call_count,1)
+        # 第二次点击的正是「放弃奖励离开」按钮，不是问句也不是「抓住奖励机会」
+        leave_click=r.click.call_args_list[1].args[0]
+        self.assertIn('离开',leave_click.text)
+        self.assertNotIn('抓住',leave_click.text)
+        self.assertLess(leave_click.bounds[0],300)
+
     def test_restart_client_runs_once_per_round(self):
         r=self.runner(); r._client_restarted=False
         self.assertTrue(r._restart_client())

@@ -43,6 +43,10 @@ DONE_PROMPT_RE = r'^(?:任务已完成|浏览已完成|浏览完成|完成浏览
 COUNTDOWN_RE = r'(?:还需|剩余|再逛|再看|浏览还差)[^\d]{0,3}(\d{1,2})\s*秒'
 # 进入浏览页时的总时长提示（「浏览20秒获得100闲鱼币」）
 BROWSE_SECONDS_RE = r'浏览\s*(\d+)\s*[秒sS]'
+# 视频页自带的倒计时（「奖励将于14秒后发放」），按它等而不必死等配置秒数
+VIDEO_REWARD_COUNTDOWN_RE = r'奖励将于\s*(\d+)\s*秒后发放'
+# 二级确认弹窗（「观看满30秒即可获得奖励 确认要离开吗？」）
+VIDEO_LEAVE_DIALOG_RE = r'确认要离开吗|放弃奖励离开'
 
 
 class IdleFishCoinsActivity(EntryPolicy, Activity):
@@ -648,6 +652,114 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         logger.info('退出弹窗点击后未回到列表，交给恢复流程重进活动')
         return screen
 
+    def _video_leave_button(self, screen):
+        """二级弹窗里的「放弃奖励离开」按钮；绝不返回「抓住奖励机会」。
+
+        弹窗标题「观看满30秒即可获得奖励 确认要离开吗？」里也带「离开」，
+        直接 find('离开') 会先命中标题文字，必须排除问句和挽留按钮。
+        """
+        if screen is None:
+            return None
+        stay = [str(w) for w in (self.config.get('video_stay_words') or []) if w]
+        for n in screen.nodes:
+            text = normalize(n.text)
+            if not text or any(w in text for w in stay):
+                continue
+            if '?' in text or '？' in text or '吗' in text:
+                continue
+            if re.search(r'放弃奖励离开|残忍离开|坚持退出|离开任务|^离开$', text):
+                return n
+        return None
+
+    def _video_handle_leave_dialog(self, screen):
+        """二级确认弹窗出现就点「离开」；看满时长后离开照样算完成。"""
+        if screen is None:
+            return False
+        if self._find(screen, VIDEO_LEAVE_DIALOG_RE) is None:
+            return False
+        button = self._video_leave_button(screen)
+        if button is None:
+            return False
+        logger.info('视频退出确认弹窗，点「%s」', button.text)
+        self.click(button)
+        self.control.wait(float(self.config.get('exit_dialog_interval', 1.0)))
+        return True
+
+    def _video_tap_close(self, screen):
+        """点视频页的关闭入口（跳过 / 关闭广告 / 右上角几何 X）。返回是否点过。"""
+        if screen is None:
+            return False
+        words = [str(w) for w in (self.config.get('video_close_words') or []) if w]
+        pattern = '|'.join(re.escape(w) for w in words)
+        node = self._find(screen, pattern) if pattern else None
+        if node is not None:
+            logger.info('视频页点关闭入口「%s」', node.text)
+            self.click(node)
+            return True
+        # 页面自带「奖励将于N秒后发放 」横幅、X 是画上去的图标（控件树无文字），
+        # 按右上角几何位置点它，避免这部分视频再也退不出去。
+        if (self._find(screen, VIDEO_REWARD_COUNTDOWN_RE) is not None
+                or self._is_ad_or_video_page(screen)):
+            x = int(screen.width * float(self.config.get('video_close_x_ratio', 0.91)))
+            y = int(screen.height * float(self.config.get('video_close_y_ratio', 0.08)))
+            logger.info('视频页按右上角几何位置点 X (%d,%d)', x, y)
+            self.click(TextNode('关闭视频', (x - 20, y - 20, x + 20, y + 20)))
+            return True
+        return False
+
+    def _video_exit(self, screen):
+        """看完视频后按人工步骤退出，尽快回到任务列表领奖。
+
+        两条路（对应人工操作）：
+        A) 手势返回 1 次 → 判定是否回列表；没回就快速再返回 2 次。
+        B) 手势退不掉的页面：点 X / 跳过 关闭入口，弹出二级确认后点
+           「放弃奖励离开」。看满时长后离开照样算完成，不点「抓住奖励机会」。
+        """
+        settle = float(self.config.get('video_back_settle', 0.8))
+        fast_gap = float(self.config.get('video_fast_back_gap', 0.25))
+
+        # 有些视频返回一次就直接弹二级确认框，先处理掉
+        if self._video_handle_leave_dialog(screen):
+            screen = self._safe_read(screen)
+            if self._at_task_list(screen):
+                return screen
+
+        # A) 手势返回一次
+        logger.info('视频看完，手势返回一次')
+        self.device.go_back()
+        self.control.wait(settle)
+        screen = self._safe_read(screen)
+        if self._at_task_list(screen):
+            logger.info('视频返回一次已回到任务列表')
+            return screen
+        if self._video_handle_leave_dialog(screen):
+            screen = self._safe_read(screen)
+            if self._at_task_list(screen):
+                return screen
+
+        # B) 手势退不掉：优先点 X / 跳过，再点二级确认的「离开」
+        if self._video_tap_close(screen):
+            self.control.wait(settle)
+            screen = self._safe_read(screen)
+            if self._video_handle_leave_dialog(screen):
+                screen = self._safe_read(screen)
+            if self._at_task_list(screen):
+                return screen
+
+        # A2) 仍没回列表：快速返回两次，每次之间仍判定，回到列表就停手
+        for _ in range(2):
+            if self._at_task_list(screen):
+                break
+            self.device.go_back()
+            self.control.wait(fast_gap)
+            screen = self._safe_read(screen)
+            if self._video_handle_leave_dialog(screen):
+                screen = self._safe_read(screen)
+            if self._at_task_list(screen):
+                logger.info('快速返回后已回到任务列表')
+                break
+        return screen
+
     # ------------------------------------------------------------------
     # 恢复：框架的一次冷启动预算用完后，补一次强制重启客户端
     # ------------------------------------------------------------------
@@ -834,17 +946,25 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                           int(width * .5), int(height * .46), duration=0.5)
 
     def _video_browse(self, seconds):
-        """视频页不用滑动，但要一直观察到时间到或出现完成提示。
+        """视频页不用滑动：等页面要求的秒数，再按人工步骤退出来领奖。
+
+        人工是「点进去 → 等 15~20 秒 → 退出来领奖」。时长优先用页面自己的
+        倒计时（「奖励将于14秒后发放」），读不到才用配置 video_seconds；
+        这样页面只要求 14 秒时不用死等 20 秒，省下的都是每轮的纯等待。
 
         刚点完「去完成」时 H5 还没跳转，第一屏读到的往往仍是任务列表；
-        只在「离开过列表又回来」或「等满时长」时才结束，否则视频一秒没播
-        就被当成看完，任务白做一次失败。
+        必须确认真的进过视频页再开始算，否则视频一秒没播就被当成看完。
         """
-        desired = int(seconds or self.config['browse']['video_seconds'])
-        total = desired + int(self.config.get('browse_extra_seconds', 5))
+        screen = self.read()
+        default = int(seconds or self.config['browse']['video_seconds'])
+        # 页面自带倒计时就按它来，并留一点缓冲，别卡在最后一秒退出
+        match = re.search(VIDEO_REWARD_COUNTDOWN_RE, normalize(screen.text))
+        desired = int(match.group(1)) if match else default
+        if match:
+            logger.info('视频页要求等待 %d 秒（页面倒计时）', desired)
+        total = max(1, desired + int(self.config.get('browse_extra_seconds', 2)))
         self.update(message='浏览视频 %d 秒' % total)
         deadline = self.control.now() + total
-        screen = self.read()
         explicit = False
         entered = False
         while True:
@@ -864,14 +984,21 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                 screen = self._safe_read(screen, force_ocr=bool(self.config['ocr']))
                 continue
             entered = True
+            # 进视频页后再读一次倒计时，页面可能这时才渲染出来
+            if not match:
+                match = re.search(VIDEO_REWARD_COUNTDOWN_RE, normalize(screen.text))
+                if match:
+                    desired = int(match.group(1))
+                    total = max(1, desired + int(self.config.get('browse_extra_seconds', 2)))
+                    deadline = self.control.now() + total
+                    logger.info('视频页要求等待 %d 秒（页面倒计时）', desired)
             remaining = deadline - self.control.now()
             if remaining <= 0:
                 break
             self.control.wait(min(2, max(.2, remaining)))
             screen = self._safe_read(screen, force_ocr=bool(self.config['ocr']))
-        # 退出确认可能连弹两次，「跳过」与「坚持退出/残忍离开/离开」合并成一组
-        # 反复点，直到不再出现为止；原先 leave 只点一次，第二次弹窗无人处理。
-        screen = self._dismiss_exit_dialogs(screen)
+        # 按人工步骤退出：手势返回1次→判定→快返2次；退不掉就 X/跳过→二级弹窗点离开
+        screen = self._video_exit(screen)
         return screen, explicit
 
     # 真正的商品卡片都标「抵后价」（闲鱼币抵扣后实付价），用它锁定商品；

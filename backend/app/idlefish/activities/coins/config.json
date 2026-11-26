@@ -75,6 +75,13 @@
 
   "video_skip_words": ["跳过"],
   "video_exit_words": ["坚持退出", "残忍离开", "离开"],
+  "video_back_settle": 0.8,
+  "video_fast_back_gap": 0.25,
+  "video_close_x_ratio": 0.91,
+  "video_close_y_ratio": 0.08,
+  "video_close_words": ["跳过", "跳过广告", "关闭广告", "关闭"],
+  "video_leave_words": ["放弃奖励离开", "坚持退出", "残忍离开", "离开"],
+  "video_stay_words": ["抓住奖励机会", "继续观看", "继续"],
 
   "browse_reward_prompt": "浏览(\\d+)秒获得",
   "browse_reward_button": "返回",
