@@ -410,7 +410,10 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         if self._is_game_container(screen):
             self._exit_game()
             raise TaskUnavailable('该任务实际是小游戏，已退出并跳过')
-        if self._is_video(task.title):
+        # 外部 App 跳转任务（去美团刷视频、去抖音看视频…）即使标题带「视频」
+        # 也是 visit 跳转，不走站内视频浏览；否则会等 15 秒再手势返回，退不回
+        # 就杀 APP 重启，白耗二十多秒还把脚本搞停。这里和 _classify 保持一致。
+        if self._is_video(task.title) and not self._has_external_app_word(task.title):
             screen, explicit = self._video_browse(task.seconds)
         else:
             screen, explicit = self._browse(task.seconds)

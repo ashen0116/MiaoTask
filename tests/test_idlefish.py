@@ -192,6 +192,19 @@ class IdlefishContracts(unittest.TestCase):
         self.assertTrue(any('退出' in t and t!='坚持退出' for t in clicked))
         self.assertNotIn('继续观看',clicked)
 
+    def test_external_app_video_task_never_uses_video_browse(self):
+        # 「去美团刷视频赚钱」带外部App词，即使标题含「视频」也绝不能走
+        # 站内视频浏览（等15秒→手势返回→退不掉就杀APP重启）。
+        r = self.runner()
+        self.assertTrue(r._is_video('去美团刷视频赚钱'))
+        self.assertTrue(r._has_external_app_word('去美团刷视频赚钱'))
+        use_video = (r._is_video('去美团刷视频赚钱')
+                     and not r._has_external_app_word('去美团刷视频赚钱'))
+        self.assertFalse(use_video)
+        # 站内视频仍要照常走视频流程
+        self.assertTrue(r._is_video('看视频赚金币')
+                        and not r._has_external_app_word('看视频赚金币'))
+
     def test_restart_client_runs_once_per_round(self):
         r=self.runner(); r._client_restarted=False
         self.assertTrue(r._restart_client())
