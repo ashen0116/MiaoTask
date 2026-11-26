@@ -11,6 +11,7 @@
   "return_back_tries": 1,
   "return_settle_seconds": 1.5,
   "resume_settle_seconds": 1.5,
+  "cross_app_resume_tries": 3,
   "restart_settle_seconds": 5.0,
   "overlay_wait_seconds": 2.0,
   "obscured_confirm_frames": 3,

@@ -44,35 +44,46 @@ class IdlefishContracts(unittest.TestCase):
         r.click.assert_not_called()
 
     def test_search_returns_contract_tuple(self):
-        r=self.runner(); r.config['search_browse_swipes']=1
-        s=Screen([TextNode('搜索',(0,0,100,40)),TextNode('搜索发现',(0,200,100,240)),
+        r=self.runner(); s=Screen([TextNode('搜索',(0,0,100,40)),TextNode('搜索发现',(0,200,100,240)),
                   TextNode('手机壳',(100,400,200,440))],600,1000,r.origin)
         r.read.return_value=s
+        r._browse=Mock(return_value=(s,False))
         result=r._search_task(s)
         self.assertIs(result[0],s); self.assertIsInstance(result[1],bool)
-        r._swipe_once.assert_called_once()
+        r._browse.assert_called_once()
 
     def test_search_without_submission_does_not_swipe(self):
         r=self.runner(); s=Screen([],600,1000,r.origin);r.read.return_value=s
+        r._browse=Mock()
         with self.assertRaises(TaskUnavailable):r._search_task(s)
-        r._swipe_once.assert_not_called()
+        r._browse.assert_not_called()
 
     def test_search_inputs_keyword_before_swiping(self):
-        r=self.runner(); r.config['search_browse_swipes']=1
-        s=self.search_page()
+        r=self.runner(); s=self.search_page()
         r.read.return_value=s
+        r._browse=Mock(return_value=(s,False))
         r._search_task(s)
         r.device.input_text.assert_called_once_with(r.config['task_search_keyword'])
-        r._swipe_once.assert_called_once()
+        r._browse.assert_called_once()
+
+    def test_search_result_browses_continuously(self):
+        # 搜索结果必须走 _browse 的不间断滑动，不能「滑一次读一次屏」把计时弄断
+        r=self.runner(); s=self.search_page()
+        r.read.return_value=s
+        r._browse=Mock(return_value=(s,False))
+        r._search_task(s)
+        r._browse.assert_called_once_with(r.config['browse']['regular_seconds'])
+        r._swipe_once.assert_not_called()   # 滑动交给 _browse，不在这里零碎滑
 
     def test_search_falls_back_to_suggestion_when_input_unavailable(self):
-        r=self.runner(); r.config['search_browse_swipes']=0
-        r.device.input_text.side_effect=TimeoutError('synthetic ime failure')
+        r=self.runner(); r.device.input_text.side_effect=TimeoutError('synthetic ime failure')
         s=self.search_page()
         r.read.return_value=s
+        r._browse=Mock(return_value=(s,False))
         r._search_task(s)
         # 搜索框一次 + 推荐词一次；输入不可用时不能直接放弃整个任务
         self.assertEqual(r.click.call_count,2)
+        r._browse.assert_called_once()
 
     def test_browse_keeps_result_when_final_read_overflows(self):
         r=self.runner(); r.control.now.side_effect=[0,0,99999]
@@ -156,6 +167,23 @@ class IdlefishContracts(unittest.TestCase):
         r=self.runner(); r._client_restarted=True
         r.setup()
         self.assertFalse(r._client_restarted)
+
+    def test_cross_app_resume_retries_before_giving_up(self):
+        # 头条这种切回慢的：第一次读屏还在头条，第二次才回到闲鱼，不该直接冷启动
+        r=self.runner(); r.config['cross_app_resume_tries']=3
+        other=Screen([],600,1000,'com.ss.android.article.news')
+        idle=self.panel()
+        r.read.side_effect=[other,idle]
+        result=r._resume_idle_fish(r.origin)
+        self.assertIs(result,idle)
+        self.assertEqual(r.device.resume_app.call_count,2)
+
+    def test_cross_app_resume_reports_offline_without_cold_start(self):
+        # 设备断流时原样抛出，不让 _return_to_list 去发 go_home/强停
+        r=self.runner()
+        r.device.resume_app.side_effect=RuntimeError('device offline')
+        with self.assertRaises(RuntimeError):
+            r._resume_idle_fish(r.origin)
 
     def test_task_panel_is_not_treated_as_landing(self):
         r=self.runner()

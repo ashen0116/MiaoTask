@@ -835,6 +835,49 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             return False
         return True
 
+    def _resume_idle_fish(self, origin):
+        """跨 App 返回时温和地把闲鱼切回前台。
+
+        返回已确认在前台的屏幕；确实切不回来返回 None，让调用方决定冷启动。
+        设备断流（offline/连接被拒）时原样抛出，交给上层有界恢复处理，
+        不在断流状态下继续发 go_home/stop_app 把 adb 连接彻底搞断。
+        """
+        tries = max(1, int(self.config.get('cross_app_resume_tries', 3)))
+        settle = float(self.config.get('resume_settle_seconds', 1.5))
+        last = None
+        for attempt in range(tries):
+            self.control.check()
+            try:
+                self.device.resume_app(origin)
+            except Exception as exc:
+                if self._device_offline(exc):
+                    raise
+                last = exc
+                self.control.wait(settle)
+                continue
+            self.control.wait(settle)
+            try:
+                resumed = self.read()
+            except Exception as exc:
+                if self._device_offline(exc):
+                    raise
+                last = exc
+                continue
+            if resumed is not None and (resumed.package or '').startswith(origin):
+                logger.info('已将闲鱼切回前台（第 %d 次）', attempt + 1)
+                return resumed
+            last = None
+        return None
+
+    @staticmethod
+    def _device_offline(exc=None):
+        """异常文案里是否出现设备断流特征（offline / 连接被拒绝 / 元数据超时）。"""
+        if exc is None:
+            return False
+        text = str(exc).lower()
+        return any(word in text for word in ('offline', 'connection refused', 'device not found',
+                                             '元数据超时', '未确认所选所选应用实例'))
+
     def _return_to_list(self, screen=None, tries=5, cold_start=False):
         """任务页结束后主动返回任务列表。
 
@@ -853,25 +896,21 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         if not (screen.package or '').startswith(origin):
             if self._at_task_list(screen):
                 return screen
-            # 跨 App 任务结束时闲鱼通常还在后台，先直接把它切回前台即可。
-            # 以前这里一律 cold_start=True（杀进程重启），页面栈和 H5 状态全丢，
-            # 还要重新走一遍导航；只有真的切不回来才该走冷启动。
+            # 跨 App 任务结束时闲鱼通常还在后台，把它切回前台即可，不必杀进程。
+            # 只试一次、只等 1.5 秒对「去头条玩一玩」这类慢切换不够：刚跳到外部
+            # App 时窗口/渲染常要几秒才就绪，一次没中就立刻 go_home+强停重启，
+            # 白等二十多秒不说，界面看着就像脚本异常停住了。改成温和重试几次。
             try:
-                self.device.resume_app(origin)
-                self.control.wait(float(self.config.get('resume_settle_seconds', 1.5)))
-                resumed = self.read()
-                if resumed is not None and (resumed.package or '').startswith(origin):
-                    logger.info('已将闲鱼切回前台，继续返回任务列表')
-                    screen = resumed
-                else:
-                    raise TaskUnavailable('切回闲鱼后仍在其它应用')
+                screen = self._resume_idle_fish(origin)
             except Exception as exc:
-                logger.warning('直接切回闲鱼失败，改用冷启动：%s', exc)
+                logger.warning('多次切回闲鱼仍未成功，改用冷启动：%s', exc)
                 try:
                     return self.recover(cold_start=True)
                 except Exception as exc2:
                     logger.warning('跨 App 返回闲鱼失败：%s', exc2)
                     return screen
+            if screen is None:
+                return self.recover(cold_start=True)
         # 视频/广告页：把连弹的退出确认一次点干净，再判断是否已经回到列表
         if self._is_ad_or_video_page(screen):
             screen = self._dismiss_exit_dialogs(screen)
@@ -1147,13 +1186,13 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             submitted = self._input_search(s) or self._tap_suggestion(s)
         if not submitted:
             raise TaskUnavailable('未确认搜索入口，跳过当前搜索任务')
-        # 浏览搜索结果：连续滑动若干次
-        swipes = int(self.config.get('search_browse_swipes', 6))
-        for _ in range(swipes):
-            self._swipe_once(s)
-            self.control.wait(0.4)
-            s = self._safe_read(s)
-        return s, bool(s.find(DONE_PROMPT_RE))
+        # 浏览搜索结果：和普通浏览一样【连续不断】滑够时长。
+        # 原来这里按「滑一次→等0.4秒→读一次屏」循环，而 DML OCR 读一屏要好几秒，
+        # 读屏期间手是停的；闲鱼只算「持续滑动」的时间，一停就重新计时，实测
+        # 滑了 15 秒只算 8 秒、任务失败。改成交给 _browse：中途完全不读屏，
+        # 手势之间只留很短间隔，滑满时长再读一次确认，和已验证的浏览任务一致。
+        s, explicit = self._browse(self.config['browse']['regular_seconds'])
+        return s, explicit
 
     def _search_keyword(self):
         """搜索任务用的关键词：活动配置优先，其次公共词表随机抽取。"""
