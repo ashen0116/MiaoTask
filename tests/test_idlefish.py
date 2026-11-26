@@ -67,6 +67,20 @@ class IdlefishContracts(unittest.TestCase):
         self.assertEqual(tasks[0].title, '搜一搜推荐好物')
         self.assertEqual(tasks[0].kind, 'search')
 
+    def test_parse_tasks_picks_full_title_not_icon_label(self):
+        # 复现线上截图：任务行最左侧图标框写着「免单」「淘宝闪购」「补」这类
+        # 1~4 字短标签，真正的标题（10 字）在它右边。必须在同一行多个候选里
+        # 选中完整标题，否则生成残片任务，一失败就被锁成「今日失败已达上限」。
+        r = self.runner()
+        s = Screen([TextNode('免单', (60, 700, 150, 740)),
+                    TextNode('逛逛淘宝闪购天天免单', (180, 700, 620, 740)),
+                    TextNode('去完成', (800, 700, 950, 740))],
+                   1000, 2000, r.origin)
+        tasks = r.parse_tasks(s.nodes, s.width, s.height)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].title, '逛逛淘宝闪购天天免单')
+        self.assertEqual(tasks[0].kind, 'visit')
+
     def test_no_navigation_for_trade_task(self):
         r=self.runner(); task=Task('t','购买商品','','去完成',(0,0,1,1),kind='trade')
         with self.assertRaises(TaskUnavailable):r.execute(task,self.panel())

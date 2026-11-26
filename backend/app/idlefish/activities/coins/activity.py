@@ -311,8 +311,16 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                    if abs(n.center[1] - btn.center[1]) < height * 0.02
                    and btn.bounds[0] - n.bounds[2] > width * 0.06]
             if row:
-                title_node = min(row, key=lambda n: (n.bounds[0],
-                                                    abs(n.center[1] - btn.center[1])))
+                # 任务行最左侧有个小图标框，里面是「补」「免单」「淘宝闪购」
+                # 「一淘」这类 1~4 字短标签；真正的标题在它右边且明显更长
+                # （「去淘宝签到领红包」「逛逛淘宝闪购天天免单」）。上一轮放宽
+                # x 范围把图标也放进候选后，按 bounds[0] 取最左就会选中图标，
+                # 生成残片任务；残片身份一失败就被锁成「今日失败已达上限」，
+                # 前端看着像任务没识别全、一进列表就被跳过。这里改成优先取
+                # 文本最长的节点——真实标题总比图标标签长；长度相同才取靠左。
+                title_node = max(row, key=lambda n: (len(normalize(n.text)),
+                                                     -n.bounds[0],
+                                                     -abs(n.center[1] - btn.center[1])))
                 title = normalize(title_node.text)
             elif action == '签到':
                 title = '每日签到'
