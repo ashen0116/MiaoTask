@@ -1289,8 +1289,8 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         # 搜索任务必须多滑一段：页面从「提交搜索」那刻就开始计时，而脚本提交前
         # 要输入/读屏确认（这几秒手是停的），闲鱼只算连续滑动时间。实测页面要
         # 求 15 秒、滑 17 秒仍差一点（只算 14 秒）。这里按页面要求再额外多滑
-        # search_browse_extra_seconds（默认 6 秒，可配置），把前面的停顿补回来。
-        extra = int(self.config.get('search_browse_extra_seconds', 6))
+        # search_browse_extra_seconds（默认 5 秒，可配置），把前面的停顿补回来。
+        extra = int(self.config.get('search_browse_extra_seconds', 5))
         s, explicit = self._browse(self.config['browse']['regular_seconds'], extra=extra)
         return s, explicit
 
