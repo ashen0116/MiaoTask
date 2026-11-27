@@ -173,6 +173,14 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         """
         return any(word in title for word in cls.EXTERNAL_APP_MAP)
 
+    @classmethod
+    def _external_target(cls, title):
+        """标题对应的外部 App 名称与包名，供框架判定安装状态。"""
+        for word, packages in cls.EXTERNAL_APP_MAP.items():
+            if word in title:
+                return word, tuple(packages)
+        return '', ()
+
     def _target_app_missing(self, title):
         packages = next((pkgs for word, pkgs in self.EXTERNAL_APP_MAP.items()
                          if word in title), None)
@@ -225,8 +233,18 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                 title = '每日签到'
             else:
                 continue
+            # 游戏类任务要识别出来但默认跳过：之前直接 continue 把整行丢掉，
+            # 页面上有 4 个任务却只显示 1 个。这里必须给带「已跳过」前缀的
+            # skip_reason——框架只把 reason 以「已跳过/未安装/目标应用」开头的
+            # 任务标成 disabled 并从候选队列剔除；写成「游戏任务，默认跳过」
+            # 只会标成 manual，下一轮仍会被当成跳转任务点下去。
+            skip_reason = ''
             if any(k in title for k in self.config['game_keywords']):
-                continue
+                skip_reason = '已跳过：游戏任务，默认跳过'
+            elif self._is_click_task(title):
+                # 「点击指定频道好物」要在频道里逐个点开 10 个商品，成本高、失败率高，
+                # 用户要求默认跳过。识别出来但标 disabled，不进入执行队列。
+                skip_reason = '已跳过：需要逐个点击多个商品，默认跳过'
             if any(k in title for k in self.config['skip_titles']):
                 continue
             if self._target_app_missing(title):
@@ -245,9 +263,14 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             # 会再点一次同一个按钮，白花 5～8 秒；进度变了（新的一档）不受影响。
             if (key, current, action) in getattr(self, '_claimed_rows', set()):
                 continue
+            kind = self._classify(title, action)
+            target_app, target_packages = ('', ())
+            if kind == 'visit':
+                target_app, target_packages = self._external_target(title)
             tasks.append(Task(key, title, title, action, btn.bounds,
                               current=current, total=total, seconds=seconds,
-                              kind=self._classify(title, action)))
+                              kind=kind, skip_reason=skip_reason,
+                              target_app=target_app, target_packages=target_packages))
         return tasks
 
     @staticmethod
@@ -283,12 +306,16 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
     def _classify(self, title, action):
         if action in ('签到', '领取奖励', '立即领取'):
             return 'claim'
-        # 真实交易类（如「去浏览全新好物下单」）：涉及真实下单付款，默认跳过
-        if '下单' in title or '购买' in title or '拍下' in title:
-            return 'trade'
         # 搜索类任务（如「搜一搜推荐商品」）：进入搜索页后还需输入关键词并浏览
         if '搜一搜' in title or '搜索' in title or '搜' in title:
             return 'search'
+        # 「点击指定频道好物」「去浏览全新好物下单」这类只是点任务入口跳转，
+        # 脚本不会真正下单或付款。以前归成 trade 会被框架静默跳过，手动执行
+        # 还会报「请先在任务设置中启用该任务类型」——而框架根本没有 trade 开关。
+        # 统一按跨应用跳转类交给框架执行和核验。
+        if (self._is_click_task(title)
+                or any(k in title for k in ('下单', '购买', '拍下'))):
+            return 'visit'
         # 「看视频 / 浏览xx」都是闲鱼内的浏览任务（已实机验证：「去浏览福利好物」
         # 进入 CsjMall 页并提示「浏览15秒获得80闲鱼币」）。
         # 关键：标题里带明确外部 App 词（淘宝/闪购/芭芭农场/支付宝…）的是跳转
@@ -298,11 +325,6 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         if not self._has_external_app_word(title) and (
                 self._is_video(title) or '浏览' in title or '逛逛' in title):
             return 'browse'
-        # 「点击指定频道好物」类任务已停用（用户要求不做）：归入 trade（跳过），
-        # 由 enabled_task_kinds 过滤，框架直接不执行，也不会再点商品卡片。
-        if self._is_click_task(title):
-            return 'trade'
-        # 其余「去完成」按跨应用处理，由 enabled_task_kinds 过滤掉。
         return 'visit'
 
     @staticmethod
@@ -396,14 +418,22 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
                 screen = self.read()
                 self.guard(screen)
                 if self._still_on_list(screen):
-                    logger.info('点击后仍停留在任务列表，判定跳转未生效：%s', task.title)
-                    raise TaskUnavailable('跳转任务未完成（目标App可能未安装），跳过：%s' % task.title)
+                    if self._target_app_missing(task.title):
+                        raise TaskUnavailable('未安装目标应用，跳过：%s' % task.title)
+                    # 仍停在列表只说明这次点击没跳出去，不是 App 未安装的证据。
+                    # 以前在这里抛 TaskUnavailable，框架会把任务永久写进
+                    # unavailable_tasks，连手动执行也被拒；改成普通失败重试。
+                    logger.info('点击后仍停留在任务列表，跳转未生效，按普通失败处理：%s', task.title)
+                    return screen, False, False
             remain = float(self.config.get('visit_seconds', 5)) - quick
             if remain > 0:
                 self.control.wait(remain)
             screen = self._return_to_list(cold_start=False)
             if not self._visit_done(task, screen):
-                raise TaskUnavailable('跳转任务未完成（目标App可能未安装），跳过：%s' % task.title)
+                if self._target_app_missing(task.title):
+                    raise TaskUnavailable('未安装目标应用，跳过：%s' % task.title)
+                logger.info('跳转后未确认进度，按普通失败处理：%s', task.title)
+                return screen, False, False
             return self._claim_ready(task, screen), False, False
         # 浏览类：跳进小游戏就退出跳过；否则立刻开始持续滑动。
         # 商品页靠滑动计时，任何停顿（弹窗处理、二次检测）都会中断计时。
@@ -1231,22 +1261,37 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         task_search_keywords 随机抽一个。输入不可用时退回点推荐词，
         两者都确认不了就跳过，不在未搜索的页面上滑动。
         """
+        # 点进搜索页后 H5 首帧常还没渲染出「搜索」字样，一次读屏找不到就跳过
+        # 会误杀本来能做的任务。连续几帧再找，每帧之间短等。
         s = self.read()
+        box = None
+        for _ in range(3):
+            box = self._find(s, r'搜索|搜一搜|找闲置|搜你想不到|请输入')
+            if box is not None:
+                break
+            self.control.wait(1)
+            s = self._safe_read(s)
         submitted = False
-        box = self._find(s, r'搜索|搜一搜|找闲置|搜你想不到')
         if box is not None:
             self.click(box)
             self.control.wait(0.8)
             s = self.read()
             submitted = self._input_search(s) or self._tap_suggestion(s)
+        else:
+            # 找不到搜索框，但只要确实离开了任务列表（已经进到搜索/商品页），
+            # 就直接按浏览处理——在这里空等再跳过只会白丢一次机会。
+            if not self.is_task_list(s.nodes):
+                logger.info('搜索任务：未找到搜索框，但已进入搜索页，直接浏览')
+                submitted = True
         if not submitted:
             raise TaskUnavailable('未确认搜索入口，跳过当前搜索任务')
         # 浏览搜索结果：和普通浏览一样【连续不断】滑够时长。
-        # 原来这里按「滑一次→等0.4秒→读一次屏」循环，而 DML OCR 读一屏要好几秒，
-        # 读屏期间手是停的；闲鱼只算「持续滑动」的时间，一停就重新计时，实测
-        # 滑了 15 秒只算 8 秒、任务失败。改成交给 _browse：中途完全不读屏，
-        # 手势之间只留很短间隔，滑满时长再读一次确认，和已验证的浏览任务一致。
-        s, explicit = self._browse(self.config['browse']['regular_seconds'])
+        # 搜索任务必须多滑一段：页面从「提交搜索」那刻就开始计时，而脚本提交前
+        # 要输入/读屏确认（这几秒手是停的），闲鱼只算连续滑动时间。实测页面要
+        # 求 15 秒、滑 17 秒仍差一点（只算 14 秒）。这里按页面要求再额外多滑
+        # search_browse_extra_seconds（默认 6 秒，可配置），把前面的停顿补回来。
+        extra = int(self.config.get('search_browse_extra_seconds', 6))
+        s, explicit = self._browse(self.config['browse']['regular_seconds'], extra=extra)
         return s, explicit
 
     def _search_keyword(self):
@@ -1259,15 +1304,38 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         return random.choice(pool) if pool else ''
 
     def _input_search(self, screen):
-        """在搜索页输入关键词并提交搜索；输入不可用返回 False。"""
+        """在搜索页输入关键词并提交搜索；输入不可用返回 False。
+
+        闲鱼搜索框是 H5 WebView，经常没有 focused 的原生 EditText，
+        device.input_text 会等 focused 控件超时（实测 -32002）。此时改走
+        input_ascii——它用系统 `input text` 直接注入按键，不依赖控件焦点，
+        淘宝活动的 H5 搜索框也是这么做的。中文词用数字 token 代替即可，
+        搜索任务只要求「搜了并浏览」，搜什么词不影响计数。
+        """
         keyword = self._search_keyword()
         if not keyword:
             return False
         try:
             self.device.input_text(keyword)
+            logger.info('搜索任务：控件输入关键词「%s」', keyword)
         except Exception as exc:
-            logger.warning('搜索任务：输入关键词失败（%s），改用推荐词', exc)
-            return False
+            logger.warning('搜索任务：控件输入失败（%s），改用 ADB 注入', exc)
+            box = self._find(screen, r'搜索|搜一搜|找闲置|搜你想不到|请输入')
+            if box is not None:
+                # 再点一次输入框，确保 H5 输入框拿到焦点
+                self.click(TextNode('', box.bounds))
+                self.control.wait(0.5)
+            ascii_input = getattr(self.device, 'input_ascii', None)
+            if not callable(ascii_input):
+                logger.warning('搜索任务：设备不支持 input_ascii，改用推荐词')
+                return False
+            token = keyword if re.fullmatch(r'[A-Za-z0-9]{1,32}', keyword) else '123'
+            try:
+                ascii_input(token)
+            except Exception as exc2:
+                logger.warning('搜索任务：ADB 注入失败（%s），改用推荐词', exc2)
+                return False
+            logger.info('搜索任务：ADB 注入关键词「%s」', token)
         self.update(message='搜索：' + keyword)
         self.control.wait(1.2)
         later = self._safe_read(screen)
@@ -1281,7 +1349,10 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
             self.click(submit)
         else:
             self.device.press('enter')
-        self.control.wait(1.5)
+        # 提交后只做极短等待：搜索结果页从提交那刻就开始算停留时间，
+        # 这里每多等一秒、每多读一屏，后面有效滑动就少一秒。确认入口是否
+        # 离开交给紧随其后的 _browse 首次读屏，不在这里重复读屏。
+        self.control.wait(0.6)
         logger.info('搜索任务：输入关键词「%s」并提交搜索', keyword)
         return True
 
@@ -1303,7 +1374,7 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         logger.info('搜索任务：点推荐词「%s」', normalize(recs[0].text))
         return True
 
-    def _browse(self, seconds):
+    def _browse(self, seconds, extra=None):
         """浏览页：必须不间断滑动满 N 秒才计时。
 
         闲鱼浏览任务按「页面持续滑动」计时，任何停顿（读屏、二次检测）都会让
@@ -1316,7 +1387,9 @@ class IdleFishCoinsActivity(EntryPolicy, Activity):
         """
         screen = self.read()
         desired = self._browse_seconds(screen, seconds)
-        total = desired + int(self.config.get('browse_extra_seconds', 5))
+        extra_seconds = (int(self.config.get('browse_extra_seconds', 5))
+                         if extra is None else max(0, int(extra)))
+        total = desired + extra_seconds
         logger.info('浏览任务：页面要求 %d 秒，连续滑动 %d 秒', desired, total)
         interval = max(0.02, float(self.config.get('browse_swipe_interval', 0.2)))
         deadline = self.control.now() + total
